@@ -1,0 +1,34 @@
+# Delphi / RAD Studio
+__history/
+*.identcache
+*.dproj.local
+*.dsk
+*.stat
+*.~*
+*.bak
+
+# Build output
+Win32/
+*.dcu
+*.dcp
+*.bpl
+*.hpp
+*.obj
+*.o
+*.map
+*.tds
+
+# Runtime artifacts
+logs/
+conf/logs/
+*.pid
+*.log
+romitter-worker-crash.log
+
+# Local OpenSSL runtime binaries at repository root
+/libssl*.dll
+/libcrypto*.dll
+
+# Local workspace for smoke tests / archives / prod snapshots
+.dev-local/*
+!.dev-local/README.md
