@@ -493,6 +493,16 @@ var
   AddrSock: TSockAddr absolute Addr;
   ReuseValue: Integer;
   ListenHost: string;
+  Existing: TRomitterStreamListener;
+  SkipListen: Boolean;
+  SharedListenLogged: TDictionary<string, Boolean>;
+  SharedListenKey: string;
+  ProtocolName: string;
+  StartupCompleted: Boolean;
+  function IsWildcardHost(const Host: string): Boolean;
+  begin
+    Result := SameText(Host, '0.0.0.0') or SameText(Host, '*');
+  end;
 begin
   if FConfig.Stream.Servers.Count = 0 then
   begin
@@ -527,11 +537,46 @@ begin
 
   FStopping := False;
   FListeners.Clear;
+  SharedListenLogged := TDictionary<string, Boolean>.Create;
+  StartupCompleted := False;
 
   try
     for Server in FConfig.Stream.Servers do
     begin
       ListenHost := NormalizeListenHost(Server.ListenHost);
+      SkipListen := False;
+      for Existing in FListeners do
+      begin
+        if Existing.IsUdp <> Server.IsUdp then
+          Continue;
+        if Existing.ListenPort <> Server.ListenPort then
+          Continue;
+        if IsWildcardHost(Existing.ListenHost) or
+           IsWildcardHost(ListenHost) or
+           SameText(Existing.ListenHost, ListenHost) then
+        begin
+          SkipListen := True;
+          Break;
+        end;
+      end;
+      if SkipListen then
+      begin
+        if Server.IsUdp then
+          ProtocolName := 'udp'
+        else
+          ProtocolName := 'tcp';
+        SharedListenKey := LowerCase(ListenHost) + ':' +
+          IntToStr(Server.ListenPort) + ':' + ProtocolName;
+        if not SharedListenLogged.ContainsKey(SharedListenKey) then
+        begin
+          FLogger.Log(rlInfo, Format(
+            'Stream listen (%s) %s:%d is shared across server blocks; reusing existing listener',
+            [ProtocolName, ListenHost, Server.ListenPort]));
+          SharedListenLogged.Add(SharedListenKey, True);
+        end;
+        Continue;
+      end;
+
       Listener := TRomitterStreamListener.Create(
         ListenHost,
         Server.ListenPort,
@@ -578,9 +623,12 @@ begin
         Listener.Free;
       end;
     end;
-  except
-    Stop;
-    raise;
+
+    StartupCompleted := True;
+  finally
+    if not StartupCompleted then
+      Stop;
+    SharedListenLogged.Free;
   end;
 end;
 

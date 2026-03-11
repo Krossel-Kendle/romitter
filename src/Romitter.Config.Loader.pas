@@ -609,7 +609,26 @@ begin
         raise ERomitterConfig.CreateFmt(
           '%s(%d): error_log requires at least one argument',
           [Directive.SourceFile, Directive.Line]);
+      if Length(Directive.Args) > 2 then
+        raise ERomitterConfig.CreateFmt(
+          '%s(%d): error_log supports at most file and level',
+          [Directive.SourceFile, Directive.Line]);
       Config.ErrorLogFile := ResolveRuntimePath(Config, Directive.Args[0]);
+      if Length(Directive.Args) = 2 then
+      begin
+        if (not SameText(Directive.Args[1], 'debug')) and
+           (not SameText(Directive.Args[1], 'info')) and
+           (not SameText(Directive.Args[1], 'notice')) and
+           (not SameText(Directive.Args[1], 'warn')) and
+           (not SameText(Directive.Args[1], 'error')) and
+           (not SameText(Directive.Args[1], 'crit')) and
+           (not SameText(Directive.Args[1], 'alert')) and
+           (not SameText(Directive.Args[1], 'emerg')) then
+          raise ERomitterConfig.CreateFmt(
+            '%s(%d): unsupported error_log level "%s"',
+            [Directive.SourceFile, Directive.Line, Directive.Args[1]]);
+        Config.ErrorLogLevel := LowerCase(Directive.Args[1]);
+      end;
       Continue;
     end;
 
@@ -794,14 +813,19 @@ begin
 
     if SameText(Child.Name, 'keepalive_timeout') then
     begin
-      if Length(Child.Args) <> 1 then
+      if (Length(Child.Args) < 1) or (Length(Child.Args) > 2) then
         raise ERomitterConfig.CreateFmt(
-          '%s(%d): keepalive_timeout requires one argument',
+          '%s(%d): keepalive_timeout requires one or two arguments',
           [Child.SourceFile, Child.Line]);
       Config.Http.KeepAliveTimeoutMs := ParseDurationMs(
         Child,
         Child.Args[0],
         'keepalive_timeout');
+      if Length(Child.Args) = 2 then
+        ParseDurationMs(
+          Child,
+          Child.Args[1],
+          'keepalive_timeout header_timeout');
       Continue;
     end;
 
@@ -1741,6 +1765,7 @@ begin
     Server.ProxyNextUpstream := Config.Http.ProxyNextUpstream;
     Server.ProxyNextUpstreamTries := Config.Http.ProxyNextUpstreamTries;
     Server.ProxyNextUpstreamTimeoutMs := Config.Http.ProxyNextUpstreamTimeoutMs;
+    Server.DefaultType := Config.Http.DefaultType;
     Server.ServerTokens := Config.Http.ServerTokens;
     Server.SslCertificateFile := Config.Http.SslCertificateFile;
     Server.SslCertificateKeyFile := Config.Http.SslCertificateKeyFile;
@@ -1902,6 +1927,16 @@ begin
         Continue;
       end;
 
+      if SameText(Child.Name, 'default_type') then
+      begin
+        if Length(Child.Args) <> 1 then
+          raise ERomitterConfig.CreateFmt(
+            '%s(%d): default_type requires one argument',
+            [Child.SourceFile, Child.Line]);
+        Server.DefaultType := Child.Args[0];
+        Continue;
+      end;
+
       if SameText(Child.Name, 'server_tokens') then
       begin
         if Length(Child.Args) <> 1 then
@@ -1916,6 +1951,30 @@ begin
           raise ERomitterConfig.CreateFmt(
             '%s(%d): server_tokens must be on or off',
             [Child.SourceFile, Child.Line]);
+        Continue;
+      end;
+
+      if SameText(Child.Name, 'allow') then
+      begin
+        if Length(Child.Args) <> 1 then
+          raise ERomitterConfig.CreateFmt(
+            '%s(%d): allow requires one argument',
+            [Child.SourceFile, Child.Line]);
+        Server.AccessRules.Add(TRomitterAccessRuleConfig.Create(
+          True,
+          Trim(Child.Args[0])));
+        Continue;
+      end;
+
+      if SameText(Child.Name, 'deny') then
+      begin
+        if Length(Child.Args) <> 1 then
+          raise ERomitterConfig.CreateFmt(
+            '%s(%d): deny requires one argument',
+            [Child.SourceFile, Child.Line]);
+        Server.AccessRules.Add(TRomitterAccessRuleConfig.Create(
+          False,
+          Trim(Child.Args[0])));
         Continue;
       end;
 
@@ -1974,6 +2033,24 @@ begin
           Child,
           Child.Args[0],
           'send_timeout');
+        Continue;
+      end;
+
+      if SameText(Child.Name, 'keepalive_timeout') then
+      begin
+        if (Length(Child.Args) < 1) or (Length(Child.Args) > 2) then
+          raise ERomitterConfig.CreateFmt(
+            '%s(%d): keepalive_timeout requires one or two arguments',
+            [Child.SourceFile, Child.Line]);
+        Server.KeepAliveTimeoutMs := ParseDurationMs(
+          Child,
+          Child.Args[0],
+          'keepalive_timeout');
+        if Length(Child.Args) = 2 then
+          ParseDurationMs(
+            Child,
+            Child.Args[1],
+            'keepalive_timeout header_timeout');
         Continue;
       end;
 
@@ -2735,6 +2812,8 @@ var
   ParsedProxyRedirectTo: string;
   ParsedErrorPage: TRomitterErrorPageConfig;
   FastCgiParamValue: string;
+  InheritedAccessRule: TRomitterAccessRuleConfig;
+  LocationAccessRulesDefined: Boolean;
 begin
   ArgCount := Length(Directive.Args);
   if ArgCount = 0 then
@@ -2756,6 +2835,10 @@ begin
         InheritedErrorPage.StatusCodes,
         InheritedErrorPage.Uri,
         InheritedErrorPage.OverrideStatus));
+    for InheritedAccessRule in Server.AccessRules do
+      Location.AccessRules.Add(TRomitterAccessRuleConfig.Create(
+        InheritedAccessRule.IsAllow,
+        InheritedAccessRule.RuleText));
     Location.ProxyRequestBuffering := Server.ProxyRequestBuffering;
     Location.ProxyBuffering := Server.ProxyBuffering;
     Location.ProxyCacheValue := Server.ProxyCacheValue;
@@ -2769,6 +2852,7 @@ begin
     Location.ProxyNextUpstream := Server.ProxyNextUpstream;
     Location.ProxyNextUpstreamTries := Server.ProxyNextUpstreamTries;
     Location.ProxyNextUpstreamTimeoutMs := Server.ProxyNextUpstreamTimeoutMs;
+    Location.DefaultType := Server.DefaultType;
     Location.ProxyRedirectOff := Server.ProxyRedirectOff;
     Location.ProxyRedirectDefault := Server.ProxyRedirectDefault;
     Location.ProxyRedirectFrom := Server.ProxyRedirectFrom;
@@ -2776,6 +2860,7 @@ begin
     LocationProxySetHeadersDefined := False;
     LocationAddHeadersDefined := False;
     LocationErrorPagesDefined := False;
+    LocationAccessRulesDefined := False;
 
     if Directive.Args[0] = '=' then
     begin
@@ -2892,12 +2977,27 @@ begin
         Continue;
       end;
 
+      if SameText(Child.Name, 'default_type') then
+      begin
+        if Length(Child.Args) <> 1 then
+          raise ERomitterConfig.CreateFmt(
+            '%s(%d): default_type requires one argument',
+            [Child.SourceFile, Child.Line]);
+        Location.DefaultType := Child.Args[0];
+        Continue;
+      end;
+
       if SameText(Child.Name, 'allow') then
       begin
         if Length(Child.Args) <> 1 then
           raise ERomitterConfig.CreateFmt(
             '%s(%d): allow requires one argument',
             [Child.SourceFile, Child.Line]);
+        if not LocationAccessRulesDefined then
+        begin
+          Location.AccessRules.Clear;
+          LocationAccessRulesDefined := True;
+        end;
         Location.AccessRules.Add(TRomitterAccessRuleConfig.Create(
           True,
           Trim(Child.Args[0])));
@@ -2910,6 +3010,11 @@ begin
           raise ERomitterConfig.CreateFmt(
             '%s(%d): deny requires one argument',
             [Child.SourceFile, Child.Line]);
+        if not LocationAccessRulesDefined then
+        begin
+          Location.AccessRules.Clear;
+          LocationAccessRulesDefined := True;
+        end;
         Location.AccessRules.Add(TRomitterAccessRuleConfig.Create(
           False,
           Trim(Child.Args[0])));
@@ -3544,6 +3649,7 @@ var
   Pair: TPair<string, string>;
   InheritedAddHeader: TRomitterAddHeaderConfig;
   InheritedErrorPage: TRomitterErrorPageConfig;
+  InheritedAccessRule: TRomitterAccessRuleConfig;
 begin
   if not Config.Http.Enabled then
     Exit;
@@ -3571,6 +3677,7 @@ begin
     Server.ProxyNextUpstream := Config.Http.ProxyNextUpstream;
     Server.ProxyNextUpstreamTries := Config.Http.ProxyNextUpstreamTries;
     Server.ProxyNextUpstreamTimeoutMs := Config.Http.ProxyNextUpstreamTimeoutMs;
+    Server.DefaultType := Config.Http.DefaultType;
     Server.ProxyRedirectOff := False;
     Server.ProxyRedirectDefault := False;
     Server.ProxyRedirectFrom := '';
@@ -3590,6 +3697,10 @@ begin
         InheritedErrorPage.StatusCodes,
         InheritedErrorPage.Uri,
         InheritedErrorPage.OverrideStatus));
+    for InheritedAccessRule in Server.AccessRules do
+      Location.AccessRules.Add(TRomitterAccessRuleConfig.Create(
+        InheritedAccessRule.IsAllow,
+        InheritedAccessRule.RuleText));
     Location.ProxyRequestBuffering := Server.ProxyRequestBuffering;
     Location.ProxyBuffering := Server.ProxyBuffering;
     Location.ProxyCacheValue := Server.ProxyCacheValue;
@@ -3603,6 +3714,7 @@ begin
     Location.ProxyNextUpstream := Server.ProxyNextUpstream;
     Location.ProxyNextUpstreamTries := Server.ProxyNextUpstreamTries;
     Location.ProxyNextUpstreamTimeoutMs := Server.ProxyNextUpstreamTimeoutMs;
+    Location.DefaultType := Server.DefaultType;
     Location.ProxyRedirectOff := Server.ProxyRedirectOff;
     Location.ProxyRedirectDefault := Server.ProxyRedirectDefault;
     Location.ProxyRedirectFrom := Server.ProxyRedirectFrom;
@@ -3634,6 +3746,10 @@ begin
             InheritedErrorPage.StatusCodes,
             InheritedErrorPage.Uri,
             InheritedErrorPage.OverrideStatus));
+        for InheritedAccessRule in Server.AccessRules do
+          Location.AccessRules.Add(TRomitterAccessRuleConfig.Create(
+            InheritedAccessRule.IsAllow,
+            InheritedAccessRule.RuleText));
         Location.ProxyRequestBuffering := Server.ProxyRequestBuffering;
         Location.ProxyBuffering := Server.ProxyBuffering;
         Location.ProxyCacheValue := Server.ProxyCacheValue;
@@ -3647,6 +3763,7 @@ begin
         Location.ProxyNextUpstream := Server.ProxyNextUpstream;
         Location.ProxyNextUpstreamTries := Server.ProxyNextUpstreamTries;
         Location.ProxyNextUpstreamTimeoutMs := Server.ProxyNextUpstreamTimeoutMs;
+        Location.DefaultType := Server.DefaultType;
         Location.ProxyRedirectOff := Server.ProxyRedirectOff;
         Location.ProxyRedirectDefault := Server.ProxyRedirectDefault;
         Location.ProxyRedirectFrom := Server.ProxyRedirectFrom;

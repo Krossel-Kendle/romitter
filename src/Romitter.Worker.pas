@@ -43,6 +43,17 @@ uses
   Romitter.Config.Loader,
   Romitter.Constants;
 
+function MapErrorLogLevelToMinLevel(const LevelText: string): TRomitterLogLevel;
+begin
+  if SameText(LevelText, 'debug') then
+    Exit(rlDebug);
+  if SameText(LevelText, 'info') or SameText(LevelText, 'notice') then
+    Exit(rlInfo);
+  if SameText(LevelText, 'warn') then
+    Exit(rlWarn);
+  Result := rlError;
+end;
+
 procedure AppendWorkerCrashLog(const WorkerId: Integer; const MessageText: string);
 var
   CrashLogPath: string;
@@ -127,6 +138,7 @@ begin
         FLogger := TRomitterLogger.Create('', False)
       else
         FLogger := TRomitterLogger.Create(FConfig.ErrorLogFile, False);
+      FLogger.MinLevel := MapErrorLogLevelToMinLevel(FConfig.ErrorLogLevel);
 
       if FConfig.Http.Enabled then
       begin

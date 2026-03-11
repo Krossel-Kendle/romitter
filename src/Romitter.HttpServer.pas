@@ -88,12 +88,17 @@ type
     class function ResolveClientBodyTimeoutMs(const Config: TRomitterConfig;
       const Server: TRomitterServerConfig;
       const Location: TRomitterLocationConfig): Integer; static;
+    class function ResolveKeepAliveTimeoutMs(const Config: TRomitterConfig;
+      const Server: TRomitterServerConfig): Integer; static;
     class function ResolveSendTimeoutMs(const Config: TRomitterConfig;
       const Server: TRomitterServerConfig;
       const Location: TRomitterLocationConfig): Integer; static;
     class function ResolveClientMaxBodySize(const Config: TRomitterConfig;
       const Server: TRomitterServerConfig;
       const Location: TRomitterLocationConfig): Int64; static;
+    class function ResolveDefaultType(const Config: TRomitterConfig;
+      const Server: TRomitterServerConfig;
+      const Location: TRomitterLocationConfig): string; static;
     function ProxyRequestSingle(const ClientSocket: TSocket; const Host: string;
       const Port: Word; const Method, ForwardUri: string;
       const Headers: TDictionary<string, string>; const Body: TBytes;
@@ -572,6 +577,7 @@ var
   ContextCache: TDictionary<string, TRomitterSslContext>;
   ContextKey: string;
   SslContext: TRomitterSslContext;
+  ContextItem: TRomitterSslContext;
 begin
   Result := False;
   ErrorText := '';
@@ -649,16 +655,17 @@ begin
     Exit(False);
   end;
 
-  if not OpenSslSetServerNameCallback(
-    FDefaultContext,
-    @OpenSslServerNameCallback,
-    Self,
-    ErrorText) then
-  begin
-    ErrorText := Format('TLS SNI setup failed for %s:%d: %s',
-      [FListenHost, FListenPort, ErrorText]);
-    Exit(False);
-  end;
+  for ContextItem in FOwnedContexts do
+    if not OpenSslSetServerNameCallback(
+      ContextItem,
+      @OpenSslServerNameCallback,
+      Self,
+      ErrorText) then
+    begin
+      ErrorText := Format('TLS SNI setup failed for %s:%d: %s',
+        [FListenHost, FListenPort, ErrorText]);
+      Exit(False);
+    end;
 
   Result := True;
 end;
@@ -1320,6 +1327,9 @@ var
   ListenSslModeConflict: Boolean;
   TlsEndpoint: TRomitterTlsEndpoint;
   TlsErrorText: string;
+  SharedListenLogged: TDictionary<string, Boolean>;
+  SharedListenKey: string;
+  StartupCompleted: Boolean;
 
   function IsWildcardHost(const Host: string): Boolean;
   begin
@@ -1354,6 +1364,8 @@ begin
 
   FStopping := False;
   FListeners.Clear;
+  SharedListenLogged := TDictionary<string, Boolean>.Create;
+  StartupCompleted := False;
 
   try
     for Server in FConfig.Http.Servers do
@@ -1396,9 +1408,18 @@ begin
           [NormalizedHost, ListenCfg.Port]);
       if SkipListen then
       begin
-        FLogger.Log(rlInfo, Format(
-          'HTTP listen %s:%d is shared across server blocks; reusing existing listener',
-          [NormalizedHost, ListenCfg.Port]));
+        SharedListenKey := LowerCase(NormalizedHost) + ':' + IntToStr(ListenCfg.Port);
+        if ListenCfg.IsSsl then
+          SharedListenKey := SharedListenKey + ':ssl'
+        else
+          SharedListenKey := SharedListenKey + ':plain';
+        if not SharedListenLogged.ContainsKey(SharedListenKey) then
+        begin
+          FLogger.Log(rlInfo, Format(
+            'HTTP listen %s:%d is shared across server blocks; reusing existing listener',
+            [NormalizedHost, ListenCfg.Port]));
+          SharedListenLogged.Add(SharedListenKey, True);
+        end;
         Continue;
       end;
 
@@ -1468,9 +1489,11 @@ begin
         FLogger.Log(rlInfo, Format('HTTPS listening on %s:%d', [Listener.ListenHost, Listener.ListenPort]))
       else
         FLogger.Log(rlInfo, Format('HTTP listening on %s:%d', [Listener.ListenHost, Listener.ListenPort]));
-  except
-    Stop;
-    raise;
+    StartupCompleted := True;
+  finally
+    if not StartupCompleted then
+      Stop;
+    SharedListenLogged.Free;
   end;
 end;
 
@@ -1760,13 +1783,19 @@ begin
           BodyKind := rbkNone;
           BodyContentLength := 0;
           NeedClientContinue := False;
-          KeepAliveTimeoutMs := ConfigSnapshot.Http.KeepAliveTimeoutMs;
-          if KeepAliveTimeoutMs <= 0 then
-            KeepAliveTimeoutMs := CLIENT_KEEPALIVE_TIMEOUT_MS;
           KeepAliveRequests := ConfigSnapshot.Http.KeepAliveRequests;
           if KeepAliveRequests <= 0 then
             KeepAliveRequests := 1000;
-          setsockopt(ClientSocket, SOL_SOCKET, SO_RCVTIMEO, PAnsiChar(@KeepAliveTimeoutMs), SizeOf(KeepAliveTimeoutMs));
+          DefaultServer := SelectServer('', LocalPortResolved, LocalAddress);
+          KeepAliveTimeoutMs := ResolveKeepAliveTimeoutMs(
+            ConfigSnapshot,
+            DefaultServer);
+          setsockopt(
+            ClientSocket,
+            SOL_SOCKET,
+            SO_RCVTIMEO,
+            PAnsiChar(@KeepAliveTimeoutMs),
+            SizeOf(KeepAliveTimeoutMs));
           if ConfigSnapshot.Http.TcpNoDelay then
             TcpNoDelayValue := 1
           else
@@ -1778,7 +1807,6 @@ begin
             PAnsiChar(@TcpNoDelayValue),
             SizeOf(TcpNoDelayValue));
 
-          DefaultServer := SelectServer('', LocalPortResolved, LocalAddress);
           SendTimeoutMs := ResolveSendTimeoutMs(
             ConfigSnapshot,
             DefaultServer,
@@ -3329,9 +3357,8 @@ begin
     PrepareLocalResponse;
     ContentType := GuessContentType(FilePath);
     if (ContentType = 'application/octet-stream') and
-       Assigned(Config) and
-       (Trim(Config.Http.DefaultType) <> '') then
-      ContentType := Trim(Config.Http.DefaultType);
+       Assigned(Config) then
+      ContentType := ResolveDefaultType(Config, Server, Location);
     if not SendFileResponse(
       ClientSocket,
       200,
@@ -4935,6 +4962,19 @@ begin
     Result := 1024 * 1024;
 end;
 
+class function TRomitterHttpServer.ResolveDefaultType(
+  const Config: TRomitterConfig; const Server: TRomitterServerConfig;
+  const Location: TRomitterLocationConfig): string;
+begin
+  Result := 'application/octet-stream';
+  if (Config <> nil) and (Trim(Config.Http.DefaultType) <> '') then
+    Result := Trim(Config.Http.DefaultType);
+  if (Server <> nil) and (Trim(Server.DefaultType) <> '') then
+    Result := Trim(Server.DefaultType);
+  if (Location <> nil) and (Trim(Location.DefaultType) <> '') then
+    Result := Trim(Location.DefaultType);
+end;
+
 class function TRomitterHttpServer.ResolveClientHeaderTimeoutMs(
   const Config: TRomitterConfig; const Server: TRomitterServerConfig;
   const Location: TRomitterLocationConfig): Integer;
@@ -4963,6 +5003,18 @@ begin
     Result := Location.ClientBodyTimeoutMs;
   if Result < 0 then
     Result := 60000;
+end;
+
+class function TRomitterHttpServer.ResolveKeepAliveTimeoutMs(
+  const Config: TRomitterConfig; const Server: TRomitterServerConfig): Integer;
+begin
+  Result := CLIENT_KEEPALIVE_TIMEOUT_MS;
+  if Config <> nil then
+    Result := Config.Http.KeepAliveTimeoutMs;
+  if (Server <> nil) and (Server.KeepAliveTimeoutMs >= 0) then
+    Result := Server.KeepAliveTimeoutMs;
+  if Result <= 0 then
+    Result := CLIENT_KEEPALIVE_TIMEOUT_MS;
 end;
 
 class function TRomitterHttpServer.ResolveSendTimeoutMs(
@@ -6761,11 +6813,7 @@ begin
         begin
           ContentType := GuessContentType(FilePath);
           if ContentType = 'application/octet-stream' then
-          begin
-            Config := ActiveConfig;
-            if (Config <> nil) and (Trim(Config.Http.DefaultType) <> '') then
-              ContentType := Trim(Config.Http.DefaultType);
-          end;
+            ContentType := ResolveDefaultType(ActiveConfig, Server, ErrorLocation);
           if SendFileResponse(
             ClientSocket,
             EffectiveStatus,

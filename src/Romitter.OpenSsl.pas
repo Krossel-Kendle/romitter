@@ -72,7 +72,7 @@ const
   SSL_CTRL_SET_TLSEXT_SERVERNAME_CB = 53;
   SSL_CTRL_SET_TLSEXT_SERVERNAME_ARG = 54;
   SSL_CTRL_SET_TLSEXT_HOSTNAME = 55;
-  SSL_CTRL_GET_TLSEXT_HOSTNAME = 55;
+  SSL_CTRL_GET_TLSEXT_HOSTNAME = 56;
   TLSEXT_NAMETYPE_host_name = 0;
 
   SSL_VERIFY_NONE = 0;
@@ -123,6 +123,8 @@ type
   TSSL_shutdown = function(const ssl: Pointer): Integer; cdecl;
   TSSL_get_error = function(const ssl: Pointer; const ret_code: Integer): Integer; cdecl;
   TSSL_set_SSL_CTX = function(const ssl: Pointer; const ctx: Pointer): Pointer; cdecl;
+  TSSL_get_servername = function(const ssl: Pointer;
+    const name_type: Integer): PAnsiChar; cdecl;
   TSSL_ctrl = function(const ssl: Pointer; const cmd: Integer;
     const larg: NativeInt; const parg: Pointer): NativeInt; cdecl;
   TERR_get_error = function: Cardinal; cdecl;
@@ -169,6 +171,7 @@ var
   FSSL_shutdown: TSSL_shutdown = nil;
   FSSL_get_error: TSSL_get_error = nil;
   FSSL_set_SSL_CTX: TSSL_set_SSL_CTX = nil;
+  FSSL_get_servername: TSSL_get_servername = nil;
   FSSL_ctrl: TSSL_ctrl = nil;
   FERR_get_error: TERR_get_error = nil;
   FERR_error_string_n: TERR_error_string_n = nil;
@@ -239,6 +242,7 @@ begin
   ResolveProc(FSSL_shutdown, GLibSsl, 'SSL_shutdown');
   ResolveProc(FSSL_get_error, GLibSsl, 'SSL_get_error');
   ResolveProc(FSSL_set_SSL_CTX, GLibSsl, 'SSL_set_SSL_CTX');
+  ResolveProc(FSSL_get_servername, GLibSsl, 'SSL_get_servername');
   ResolveProc(FSSL_ctrl, GLibSsl, 'SSL_ctrl');
   ResolveProc(FERR_get_error, GLibCrypto, 'ERR_get_error');
   ResolveProc(FERR_error_string_n, GLibCrypto, 'ERR_error_string_n');
@@ -1031,13 +1035,19 @@ var
   ServerNamePtr: Pointer;
 begin
   Result := '';
-  if (Ssl = nil) or (not Assigned(FSSL_ctrl)) then
+  if Ssl = nil then
     Exit;
-  ServerNamePtr := Pointer(FSSL_ctrl(
-    Ssl,
-    SSL_CTRL_GET_TLSEXT_HOSTNAME,
-    TLSEXT_NAMETYPE_host_name,
-    nil));
+  ServerNamePtr := nil;
+  if Assigned(FSSL_get_servername) then
+    ServerNamePtr := FSSL_get_servername(
+      Ssl,
+      TLSEXT_NAMETYPE_host_name);
+  if (ServerNamePtr = nil) and Assigned(FSSL_ctrl) then
+    ServerNamePtr := Pointer(FSSL_ctrl(
+      Ssl,
+      SSL_CTRL_GET_TLSEXT_HOSTNAME,
+      TLSEXT_NAMETYPE_host_name,
+      nil));
   if ServerNamePtr <> nil then
     Result := string(AnsiString(PAnsiChar(ServerNamePtr)));
 end;

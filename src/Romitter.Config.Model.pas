@@ -99,6 +99,7 @@ type
   public
     MatchKind: TRomitterLocationMatchKind;
     MatchPath: string;
+    DefaultType: string;
     Root: string;
     AliasPath: string;
     IndexFiles: TArray<string>;
@@ -166,6 +167,7 @@ type
     ListenHost: string;
     ListenPort: Word;
     Listens: TObjectList<TRomitterHttpListenConfig>;
+    DefaultType: string;
     ServerNames: TArray<string>;
     Root: string;
     IndexFiles: TArray<string>;
@@ -173,6 +175,7 @@ type
     ClientHeaderTimeoutMs: Integer;
     ClientBodyTimeoutMs: Integer;
     SendTimeoutMs: Integer;
+    KeepAliveTimeoutMs: Integer;
     ClientMaxBodySize: Int64;
     ProxySetHeaders: TDictionary<string, string>;
     ProxyRequestBuffering: Boolean;
@@ -193,6 +196,7 @@ type
     ServerTokens: Boolean;
     AddHeaders: TObjectList<TRomitterAddHeaderConfig>;
     ErrorPages: TObjectList<TRomitterErrorPageConfig>;
+    AccessRules: TObjectList<TRomitterAccessRuleConfig>;
     ProxyRedirectOff: Boolean;
     ProxyRedirectDefault: Boolean;
     ProxyRedirectFrom: string;
@@ -299,6 +303,7 @@ type
     WorkerProcesses: Integer;
     WorkerRlimitNofile: Integer;
     ErrorLogFile: string;
+    ErrorLogLevel: string;
     PidFile: string;
     Events: TRomitterEventsConfig;
     Http: TRomitterHttpConfig;
@@ -592,6 +597,7 @@ begin
   inherited Create;
   MatchKind := lmkPrefix;
   MatchPath := '/';
+  DefaultType := '';
   Root := '';
   AliasPath := '';
   IndexFiles := nil;
@@ -626,6 +632,7 @@ begin
   ReturnBody := '';
   AddHeaders := TObjectList<TRomitterAddHeaderConfig>.Create(True);
   ErrorPages := TObjectList<TRomitterErrorPageConfig>.Create(True);
+  AccessRules := TObjectList<TRomitterAccessRuleConfig>.Create(True);
   ProxyRedirectOff := False;
   ProxyRedirectDefault := False;
   ProxyRedirectFrom := '';
@@ -634,7 +641,6 @@ begin
   SubFilterReplacement := '';
   SubFilterTypes := nil;
   SubFilterOnce := True;
-  AccessRules := TObjectList<TRomitterAccessRuleConfig>.Create(True);
 end;
 
 destructor TRomitterLocationConfig.Destroy;
@@ -666,6 +672,7 @@ begin
   ListenHost := '0.0.0.0';
   ListenPort := 80;
   Listens := TObjectList<TRomitterHttpListenConfig>.Create(True);
+  DefaultType := '';
   Root := '';
   SetLength(IndexFiles, 1);
   IndexFiles[0] := 'index.html';
@@ -673,6 +680,7 @@ begin
   ClientHeaderTimeoutMs := -1;
   ClientBodyTimeoutMs := -1;
   SendTimeoutMs := -1;
+  KeepAliveTimeoutMs := -1;
   ClientMaxBodySize := -1;
   ProxySetHeaders := TDictionary<string, string>.Create;
   ProxyRequestBuffering := True;
@@ -693,6 +701,7 @@ begin
   ServerTokens := True;
   AddHeaders := TObjectList<TRomitterAddHeaderConfig>.Create(True);
   ErrorPages := TObjectList<TRomitterErrorPageConfig>.Create(True);
+  AccessRules := TObjectList<TRomitterAccessRuleConfig>.Create(True);
   ProxyRedirectOff := False;
   ProxyRedirectDefault := False;
   ProxyRedirectFrom := '';
@@ -709,6 +718,7 @@ end;
 
 destructor TRomitterServerConfig.Destroy;
 begin
+  AccessRules.Free;
   ErrorPages.Free;
   AddHeaders.Free;
   ProxySetHeaders.Free;
@@ -817,6 +827,7 @@ begin
   WorkerProcesses := 1;
   WorkerRlimitNofile := 0;
   ErrorLogFile := ROMITTER_DEFAULT_ERROR_LOG_FILE;
+  ErrorLogLevel := 'error';
   PidFile := ROMITTER_DEFAULT_PID_FILE;
   Events.WorkerConnections := 1024;
   Events.MultiAccept := False;

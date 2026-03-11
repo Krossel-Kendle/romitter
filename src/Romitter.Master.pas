@@ -18,6 +18,8 @@ type
     FConfigPath: string;
     FPrefix: string;
     FPipeName: string;
+    FInstanceMutexName: string;
+    FInstanceMutex: THandle;
     FSignalEvent: THandle;
     FSignalLock: TObject;
     FPendingSignal: TRomitterSignal;
@@ -64,6 +66,8 @@ type
     procedure StopSingleRuntime(const FastShutdown: Boolean);
     procedure StartCurrentRuntime;
     procedure StopCurrentRuntime(const FastShutdown: Boolean);
+    procedure AcquireInstanceMutex;
+    procedure ReleaseInstanceMutex;
     function ReloadRuntime: Boolean;
   public
     constructor Create(const ConfigPath, Prefix: string);
@@ -82,12 +86,29 @@ uses
   Romitter.Constants,
   Romitter.Utils;
 
+function MapErrorLogLevelToMinLevel(const LevelText: string): TRomitterLogLevel;
+begin
+  if SameText(LevelText, 'debug') then
+    Exit(rlDebug);
+  if SameText(LevelText, 'info') or SameText(LevelText, 'notice') then
+    Exit(rlInfo);
+  if SameText(LevelText, 'warn') then
+    Exit(rlWarn);
+  Result := rlError;
+end;
+
 constructor TRomitterMaster.Create(const ConfigPath, Prefix: string);
 begin
   inherited Create;
   FConfigPath := ConfigPath;
   FPrefix := Prefix;
   FPipeName := BuildControlPipeName(FPrefix, FConfigPath);
+  FInstanceMutexName := StringReplace(
+    StringReplace(FPipeName, '\\.\pipe\', 'Local\', [rfIgnoreCase]),
+    '\',
+    '-',
+    [rfReplaceAll]);
+  FInstanceMutex := 0;
   FSignalEvent := CreateEvent(nil, False, False, nil);
   if FSignalEvent = 0 then
     raise Exception.Create('Unable to create master signal event');
@@ -118,6 +139,7 @@ begin
   StopCurrentRuntime(True);
   CloseWorkerEvents;
   RemovePidFile;
+  ReleaseInstanceMutex;
   FControl.Free;
   FStreamServer.Free;
   FHttpServer.Free;
@@ -731,6 +753,40 @@ begin
   FWorkerModeEnabled := False;
 end;
 
+procedure TRomitterMaster.AcquireInstanceMutex;
+var
+  LastErrorCode: DWORD;
+begin
+  if FInstanceMutex <> 0 then
+    Exit;
+
+  FInstanceMutex := CreateMutex(nil, True, PChar(FInstanceMutexName));
+  if FInstanceMutex = 0 then
+    raise Exception.CreateFmt(
+      'unable to acquire instance lock "%s" (error %d)',
+      [FInstanceMutexName, GetLastError]);
+
+  LastErrorCode := GetLastError;
+  if (LastErrorCode = ERROR_ALREADY_EXISTS) or
+     (LastErrorCode = ERROR_ACCESS_DENIED) then
+  begin
+    CloseHandle(FInstanceMutex);
+    FInstanceMutex := 0;
+    raise Exception.CreateFmt(
+      'another master instance is already running for this config (lock "%s")',
+      [FInstanceMutexName]);
+  end;
+end;
+
+procedure TRomitterMaster.ReleaseInstanceMutex;
+begin
+  if FInstanceMutex = 0 then
+    Exit;
+  ReleaseMutex(FInstanceMutex);
+  CloseHandle(FInstanceMutex);
+  FInstanceMutex := 0;
+end;
+
 function TRomitterMaster.ReloadRuntime: Boolean;
 var
   NewConfig: TRomitterConfig;
@@ -914,11 +970,13 @@ begin
   Result := 1;
   ShutdownSignal := rsQuit;
   try
+    AcquireInstanceMutex;
     FConfig := TRomitterConfigLoader.LoadFromFile(FConfigPath, FPrefix);
     if SameText(FConfig.ErrorLogFile, 'stderr') then
       FLogger := TRomitterLogger.Create('', True)
     else
       FLogger := TRomitterLogger.Create(FConfig.ErrorLogFile, True);
+    FLogger.MinLevel := MapErrorLogLevelToMinLevel(FConfig.ErrorLogLevel);
 
     FControl := TRomitterControlServer.Create(FPipeName, ControlSignalHandler, FLogger);
     FControl.Start;
@@ -971,6 +1029,7 @@ begin
     StopCurrentRuntime(ShutdownSignal = rsStop);
     CloseWorkerEvents;
     RemovePidFile;
+    ReleaseInstanceMutex;
     if Assigned(FLogger) then
       FLogger.Log(rlInfo, 'Master stopped');
   end;

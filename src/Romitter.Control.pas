@@ -294,10 +294,12 @@ var
   PipeHandle: THandle;
   Connected: BOOL;
   ErrorCode: DWORD;
+  NextPipeBusyLogTick: UInt64;
   Buffer: array[0..127] of AnsiChar;
   BytesRead: DWORD;
   SignalText: string;
 begin
+  NextPipeBusyLogTick := 0;
   while not FStopping do
   begin
     PipeHandle := CreateNamedPipe(
@@ -312,8 +314,19 @@ begin
 
     if PipeHandle = INVALID_HANDLE_VALUE then
     begin
-      if Assigned(FLogger) then
-        FLogger.Log(rlError, Format('CreateNamedPipe failed (%d)', [GetLastError]));
+      ErrorCode := GetLastError;
+      if ErrorCode = ERROR_PIPE_BUSY then
+      begin
+        if Assigned(FLogger) and (GetTickCount64 >= NextPipeBusyLogTick) then
+        begin
+          FLogger.Log(rlWarn, Format(
+            'CreateNamedPipe failed (%d): another master may already own control pipe "%s"',
+            [ErrorCode, FPipeName]));
+          NextPipeBusyLogTick := GetTickCount64 + 5000;
+        end;
+      end
+      else if Assigned(FLogger) then
+        FLogger.Log(rlError, Format('CreateNamedPipe failed (%d)', [ErrorCode]));
       Sleep(200);
       Continue;
     end;

@@ -17,6 +17,7 @@ type
   private
     FCommand: TRomitterCommand;
     FConfigPath: string;
+    FConfigPathExplicit: Boolean;
     FPrefix: string;
     FSignal: TRomitterSignal;
     FWorkerId: Integer;
@@ -25,6 +26,8 @@ type
     FWorkerReadyEventName: string;
     FWorkerParentPid: Cardinal;
     FMaster: TRomitterMaster;
+    function PreferredDefaultConfigFile: string;
+    procedure ResolveDefaultConfigPath;
     procedure ParseCommandLine;
     procedure PrintUsage;
     procedure PrintVersion;
@@ -44,6 +47,7 @@ implementation
 uses
   System.Classes,
   Romitter.Constants,
+  Romitter.Utils,
   Romitter.Config.Ast,
   Romitter.Config.Model,
   Romitter.Config.Loader,
@@ -54,6 +58,7 @@ begin
   inherited;
   FCommand := rcRun;
   FConfigPath := ROMITTER_DEFAULT_CONFIG_FILE;
+  FConfigPathExplicit := False;
   FPrefix := '';
   FSignal := rsNone;
   FWorkerId := 0;
@@ -63,6 +68,46 @@ begin
   FWorkerParentPid := 0;
   FMaster := nil;
   GInstance := Self;
+end;
+
+function TRomitterApplication.PreferredDefaultConfigFile: string;
+var
+  ExeBaseName: string;
+begin
+  ExeBaseName := ChangeFileExt(ExtractFileName(ParamStr(0)), '');
+  if SameText(ExeBaseName, 'nginx') then
+    Result := ROMITTER_DEFAULT_NGINX_CONFIG_FILE
+  else
+    Result := ROMITTER_DEFAULT_CONFIG_FILE;
+end;
+
+procedure TRomitterApplication.ResolveDefaultConfigPath;
+var
+  PrimaryConfig: string;
+  SecondaryConfig: string;
+  BasePath: string;
+begin
+  if FConfigPathExplicit then
+    Exit;
+
+  PrimaryConfig := PreferredDefaultConfigFile;
+  if SameText(PrimaryConfig, ROMITTER_DEFAULT_CONFIG_FILE) then
+    SecondaryConfig := ROMITTER_DEFAULT_NGINX_CONFIG_FILE
+  else
+    SecondaryConfig := ROMITTER_DEFAULT_CONFIG_FILE;
+
+  BasePath := FPrefix;
+  if BasePath = '' then
+    BasePath := ExtractFilePath(ParamStr(0));
+  if BasePath = '' then
+    BasePath := GetCurrentDir;
+
+  if FileExists(ResolvePath(BasePath, PrimaryConfig)) then
+    FConfigPath := PrimaryConfig
+  else if FileExists(ResolvePath(BasePath, SecondaryConfig)) then
+    FConfigPath := SecondaryConfig
+  else
+    FConfigPath := PrimaryConfig;
 end;
 
 destructor TRomitterApplication.Destroy;
@@ -202,6 +247,7 @@ begin
         raise Exception.Create('Option -c requires a value');
       Inc(I);
       FConfigPath := ParamStr(I);
+      FConfigPathExplicit := True;
       Inc(I);
       Continue;
     end;
@@ -233,6 +279,8 @@ begin
 
     raise Exception.CreateFmt('Unknown argument: %s', [Param]);
   end;
+
+  ResolveDefaultConfigPath;
 end;
 
 function TRomitterApplication.RunWorker: Integer;
