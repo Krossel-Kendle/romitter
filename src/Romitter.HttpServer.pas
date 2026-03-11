@@ -101,7 +101,10 @@ type
       const Location: TRomitterLocationConfig): string; static;
     function ProxyRequestSingle(const ClientSocket: TSocket; const Host: string;
       const Port: Word; const Method, ForwardUri: string;
-      const Headers: TDictionary<string, string>; const Body: TBytes;
+      const Headers: TDictionary<string, string>;
+      const ClientHeaders: TDictionary<string, string>;
+      const Location: TRomitterLocationConfig;
+      const Body: TBytes;
       const BodyDeferred: Boolean; const BodyKind: TRomitterRequestBodyKind;
       const BodyContentLength: Integer; const NeedClientContinue: Boolean;
       const ClientMaxBodySize: Int64; const ClientBodyTimeoutMs: Integer;
@@ -154,6 +157,8 @@ type
     class function ShouldApplySubFilterToContentType(const ContentType: string;
       const SubFilterTypes: TArray<string>): Boolean; static;
     class function LocationHasBufferedResponseFilters(
+      const Location: TRomitterLocationConfig): Boolean; static;
+    class function LocationHasStreamingHeaderFilters(
       const Location: TRomitterLocationConfig): Boolean; static;
     function ApplyBufferedProxyResponseFilters(const ClientSocket: TSocket;
       const ClientHeaders: TDictionary<string, string>;
@@ -3956,12 +3961,21 @@ class function TRomitterHttpServer.LocationHasBufferedResponseFilters(
 begin
   if Location = nil then
     Exit(False);
+  // Body rewriting (sub_filter) requires full buffering.
+  // Header-only filters are applied in streaming mode.
+  Result := (Location.SubFilterSearch <> '');
+end;
+
+class function TRomitterHttpServer.LocationHasStreamingHeaderFilters(
+  const Location: TRomitterLocationConfig): Boolean;
+begin
+  if Location = nil then
+    Exit(False);
   Result :=
     (Location.AddHeaders.Count > 0) or
     ((not Location.ProxyRedirectOff) and
      (Location.ProxyRedirectDefault or
-      ((Location.ProxyRedirectFrom <> '') and (Location.ProxyRedirectTo <> '')))) or
-    (Location.SubFilterSearch <> '');
+      ((Location.ProxyRedirectFrom <> '') and (Location.ProxyRedirectTo <> ''))));
 end;
 
 function TRomitterHttpServer.ApplyBufferedProxyResponseFilters(
@@ -5034,7 +5048,10 @@ end;
 
 function TRomitterHttpServer.ProxyRequestSingle(const ClientSocket: TSocket;
   const Host: string; const Port: Word; const Method, ForwardUri: string;
-  const Headers: TDictionary<string, string>; const Body: TBytes;
+  const Headers: TDictionary<string, string>;
+  const ClientHeaders: TDictionary<string, string>;
+  const Location: TRomitterLocationConfig;
+  const Body: TBytes;
   const BodyDeferred: Boolean; const BodyKind: TRomitterRequestBodyKind;
   const BodyContentLength: Integer; const NeedClientContinue: Boolean;
   const ClientMaxBodySize: Int64; const ClientBodyTimeoutMs: Integer;
@@ -5562,6 +5579,16 @@ begin
           ResponseHeaderEndPos := FindByteSequence(ResponseHeaderBuffer, HeaderDelimiter);
           if ResponseHeaderEndPos >= 0 then
           begin
+            if LocationHasStreamingHeaderFilters(Location) then
+              ResponseHeaderBuffer := ApplyBufferedProxyResponseFilters(
+                ClientSocket,
+                ClientHeaders,
+                Location,
+                Host,
+                Port,
+                ForwardUri,
+                Method,
+                ResponseHeaderBuffer);
             if not ParseHttpStatusCode(ResponseHeaderBuffer, StatusCode) then
             begin
               AttemptKind := pakInvalidHeader;
@@ -5753,6 +5780,8 @@ begin
         Method,
         ForwardUri,
         ForwardHeaders,
+        Headers,
+        Location,
         Body,
         BodyDeferred,
         BodyKind,
@@ -5869,6 +5898,8 @@ begin
           Method,
           ForwardUri,
           ForwardHeaders,
+          Headers,
+          Location,
           Body,
           BodyDeferred,
           BodyKind,
