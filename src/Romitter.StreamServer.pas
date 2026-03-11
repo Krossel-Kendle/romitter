@@ -19,10 +19,11 @@ type
     ListenHost: string;
     ListenPort: Word;
     IsUdp: Boolean;
+    UsesProxyProtocol: Boolean;
     ListenSocket: TSocket;
     AcceptThread: TThread;
     constructor Create(const AListenHost: string; const AListenPort: Word;
-      const AIsUdp: Boolean);
+      const AIsUdp: Boolean; const AUsesProxyProtocol: Boolean = False);
     destructor Destroy; override;
   end;
 
@@ -52,6 +53,8 @@ type
     procedure ClientConnected(const ClientSocket: TSocket);
     procedure ClientDisconnected(const ClientSocket: TSocket);
     procedure ForceCloseClients;
+    function ReadProxyProtocolHeader(const ClientSocket: TSocket;
+      out ClientAddress: string; out ErrorText: string): Boolean;
     procedure HandleClient(const Listener: TRomitterStreamListener;
       const ClientSocket: TSocket);
     function ParseProxyPassTarget(const ProxyPass: string; const IsUdp: Boolean;
@@ -74,6 +77,8 @@ type
     class function IsSocketTimeoutError(const ErrorCode: Integer): Boolean; static;
     class function IsRetriableAttempt(const AttemptKind: TRomitterStreamAttemptKind;
       const Conditions: TRomitterProxyNextUpstreamConditions): Boolean; static;
+    class function TryParseIpv4Address(const Value: string;
+      out AddressValue: Cardinal): Boolean; static;
     class function GetClientIpHash(const ClientSocket: TSocket): Cardinal; static;
     class function GetClientIpHashFromAddr(const ClientAddr: TSockAddrIn): Cardinal; static;
   public
@@ -98,6 +103,8 @@ const
 
 threadvar
   GStreamRequestConfig: TRomitterConfig;
+  GStreamProxyProtocolClientAddress: string;
+  GStreamProxyProtocolAddressValid: Boolean;
 
 procedure StartThreadCompat(const Thread: TThread);
 begin
@@ -306,12 +313,14 @@ begin
 end;
 
 constructor TRomitterStreamListener.Create(const AListenHost: string;
-  const AListenPort: Word; const AIsUdp: Boolean);
+  const AListenPort: Word; const AIsUdp: Boolean;
+  const AUsesProxyProtocol: Boolean);
 begin
   inherited Create;
   ListenHost := AListenHost;
   ListenPort := AListenPort;
   IsUdp := AIsUdp;
+  UsesProxyProtocol := AUsesProxyProtocol;
   ListenSocket := INVALID_SOCKET;
   AcceptThread := nil;
 end;
@@ -495,6 +504,7 @@ var
   ListenHost: string;
   Existing: TRomitterStreamListener;
   SkipListen: Boolean;
+  ListenProxyProtocolConflict: Boolean;
   SharedListenLogged: TDictionary<string, Boolean>;
   SharedListenKey: string;
   ProtocolName: string;
@@ -545,6 +555,7 @@ begin
     begin
       ListenHost := NormalizeListenHost(Server.ListenHost);
       SkipListen := False;
+      ListenProxyProtocolConflict := False;
       for Existing in FListeners do
       begin
         if Existing.IsUdp <> Server.IsUdp then
@@ -555,10 +566,17 @@ begin
            IsWildcardHost(ListenHost) or
            SameText(Existing.ListenHost, ListenHost) then
         begin
-          SkipListen := True;
+          if Existing.UsesProxyProtocol <> Server.UsesProxyProtocol then
+            ListenProxyProtocolConflict := True
+          else
+            SkipListen := True;
           Break;
         end;
       end;
+      if ListenProxyProtocolConflict then
+        raise Exception.CreateFmt(
+          'Conflicting stream listen options for %s:%d: proxy_protocol and non-proxy_protocol listeners cannot share endpoint',
+          [ListenHost, Server.ListenPort]);
       if SkipListen then
       begin
         if Server.IsUdp then
@@ -569,7 +587,7 @@ begin
           IntToStr(Server.ListenPort) + ':' + ProtocolName;
         if not SharedListenLogged.ContainsKey(SharedListenKey) then
         begin
-          FLogger.Log(rlInfo, Format(
+          FLogger.Log(rlDebug, Format(
             'Stream listen (%s) %s:%d is shared across server blocks; reusing existing listener',
             [ProtocolName, ListenHost, Server.ListenPort]));
           SharedListenLogged.Add(SharedListenKey, True);
@@ -580,7 +598,8 @@ begin
       Listener := TRomitterStreamListener.Create(
         ListenHost,
         Server.ListenPort,
-        Server.IsUdp);
+        Server.IsUdp,
+        Server.UsesProxyProtocol);
       try
         if Listener.IsUdp then
           Listener.ListenSocket := socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
@@ -613,10 +632,10 @@ begin
         Listener.AcceptThread := TRomitterStreamAcceptThread.Create(Self, Listener);
         FListeners.Add(Listener);
         if Listener.IsUdp then
-          FLogger.Log(rlInfo, Format('Stream listening (udp) on %s:%d',
+          FLogger.Log(rlDebug, Format('Stream listening (udp) on %s:%d',
             [Listener.ListenHost, Listener.ListenPort]))
         else
-          FLogger.Log(rlInfo, Format('Stream listening (tcp) on %s:%d',
+          FLogger.Log(rlDebug, Format('Stream listening (tcp) on %s:%d',
             [Listener.ListenHost, Listener.ListenPort]));
         Listener := nil;
       finally
@@ -649,6 +668,207 @@ begin
     shutdown(ClientSocket, SD_BOTH);
     closesocket(ClientSocket);
   end;
+end;
+
+function TRomitterStreamServer.ReadProxyProtocolHeader(const ClientSocket: TSocket;
+  out ClientAddress: string; out ErrorText: string): Boolean;
+const
+  MAX_PROXY_V1_HEADER = 512;
+  PROXY_V2_SIGNATURE: array[0..11] of Byte =
+    ($0D, $0A, $0D, $0A, $00, $0D, $0A, $51, $55, $49, $54, $0A);
+var
+  FirstByte: Byte;
+  PrefixBytes: TBytes;
+  HeaderBytes: TBytes;
+  Payload: TBytes;
+  LineBytes: TBytes;
+  ByteValue: Byte;
+  ReadLen: Integer;
+  I: Integer;
+  LineText: string;
+  Parts: TStringList;
+  ProxyTransport: string;
+  IpValue: Cardinal;
+  VersionNibble: Byte;
+  CommandNibble: Byte;
+  FamilyNibble: Byte;
+  PayloadLength: Word;
+  function ReadExact(const ByteCount: Integer; out Data: TBytes): Boolean;
+  var
+    Offset: Integer;
+    ChunkLen: Integer;
+  begin
+    SetLength(Data, 0);
+    if ByteCount < 0 then
+      Exit(False);
+    if ByteCount = 0 then
+      Exit(True);
+    SetLength(Data, ByteCount);
+    Offset := 0;
+    while Offset < ByteCount do
+    begin
+      ChunkLen := recv(
+        ClientSocket,
+        Data[Offset],
+        ByteCount - Offset,
+        0);
+      if ChunkLen <= 0 then
+        Exit(False);
+      Inc(Offset, ChunkLen);
+    end;
+    Result := True;
+  end;
+begin
+  Result := False;
+  ErrorText := '';
+  ClientAddress := '';
+
+  ReadLen := recv(ClientSocket, FirstByte, 1, 0);
+  if ReadLen <> 1 then
+  begin
+    ErrorText := 'unable to read PROXY protocol header';
+    Exit(False);
+  end;
+
+  if FirstByte = Ord('P') then
+  begin
+    SetLength(LineBytes, 1);
+    LineBytes[0] := FirstByte;
+    while True do
+    begin
+      if Length(LineBytes) > MAX_PROXY_V1_HEADER then
+      begin
+        ErrorText := 'PROXY protocol v1 header is too large';
+        Exit(False);
+      end;
+      ReadLen := recv(ClientSocket, ByteValue, 1, 0);
+      if ReadLen <> 1 then
+      begin
+        ErrorText := 'unexpected EOF while reading PROXY protocol v1 header';
+        Exit(False);
+      end;
+      SetLength(LineBytes, Length(LineBytes) + 1);
+      LineBytes[High(LineBytes)] := ByteValue;
+      if (Length(LineBytes) >= 2) and
+         (LineBytes[High(LineBytes) - 1] = Ord(#13)) and
+         (LineBytes[High(LineBytes)] = Ord(#10)) then
+        Break;
+    end;
+
+    LineText := TEncoding.ASCII.GetString(LineBytes);
+    LineText := Trim(LineText);
+    if not StartsText('PROXY ', LineText) then
+    begin
+      ErrorText := 'invalid PROXY protocol v1 preface';
+      Exit(False);
+    end;
+
+    Parts := TStringList.Create;
+    try
+      ExtractStrings([' '], [], PChar(LineText), Parts);
+      if Parts.Count < 2 then
+      begin
+        ErrorText := 'invalid PROXY protocol v1 header';
+        Exit(False);
+      end;
+
+      ProxyTransport := UpperCase(Trim(Parts[1]));
+      if ProxyTransport = 'UNKNOWN' then
+      begin
+        Result := True;
+        Exit;
+      end;
+      if (ProxyTransport <> 'TCP4') and (ProxyTransport <> 'TCP6') then
+      begin
+        ErrorText := Format('unsupported PROXY protocol v1 transport "%s"', [ProxyTransport]);
+        Exit(False);
+      end;
+      if Parts.Count < 6 then
+      begin
+        ErrorText := 'invalid PROXY protocol v1 address tuple';
+        Exit(False);
+      end;
+      ClientAddress := Trim(Parts[2]);
+      if (ProxyTransport = 'TCP4') and
+         ((ClientAddress = '') or (not TryParseIpv4Address(ClientAddress, IpValue))) then
+      begin
+        ErrorText := 'invalid PROXY protocol v1 source IPv4 address';
+        Exit(False);
+      end;
+      if ProxyTransport = 'TCP6' then
+        ClientAddress := '';
+
+      Result := True;
+      Exit;
+    finally
+      Parts.Free;
+    end;
+  end;
+
+  if FirstByte <> PROXY_V2_SIGNATURE[0] then
+  begin
+    ErrorText := 'invalid PROXY protocol preface';
+    Exit(False);
+  end;
+
+  if not ReadExact(11, PrefixBytes) then
+  begin
+    ErrorText := 'unable to read PROXY protocol v2 signature';
+    Exit(False);
+  end;
+  for I := 0 to High(PrefixBytes) do
+    if PrefixBytes[I] <> PROXY_V2_SIGNATURE[I + 1] then
+    begin
+      ErrorText := 'invalid PROXY protocol v2 signature';
+      Exit(False);
+    end;
+
+  if not ReadExact(4, HeaderBytes) then
+  begin
+    ErrorText := 'unable to read PROXY protocol v2 header';
+    Exit(False);
+  end;
+
+  VersionNibble := HeaderBytes[0] shr 4;
+  CommandNibble := HeaderBytes[0] and $0F;
+  FamilyNibble := HeaderBytes[1] shr 4;
+  PayloadLength := (Word(HeaderBytes[2]) shl 8) or Word(HeaderBytes[3]);
+
+  if VersionNibble <> $2 then
+  begin
+    ErrorText := 'unsupported PROXY protocol version';
+    Exit(False);
+  end;
+
+  if not ReadExact(PayloadLength, Payload) then
+  begin
+    ErrorText := 'unable to read PROXY protocol v2 payload';
+    Exit(False);
+  end;
+
+  if CommandNibble = $0 then
+  begin
+    Result := True;
+    Exit;
+  end;
+  if CommandNibble <> $1 then
+  begin
+    ErrorText := 'unsupported PROXY protocol v2 command';
+    Exit(False);
+  end;
+
+  if (FamilyNibble = $1) and (PayloadLength >= 12) then
+  begin
+    ClientAddress := Format(
+      '%d.%d.%d.%d',
+      [Payload[0], Payload[1], Payload[2], Payload[3]]);
+    Result := True;
+    Exit;
+  end;
+
+  // IPv6 / UNSPEC are accepted, but hash falls back to socket address.
+  ClientAddress := '';
+  Result := True;
 end;
 
 procedure TRomitterStreamServer.Stop(const Force: Boolean);
@@ -876,13 +1096,46 @@ begin
   end;
 end;
 
+class function TRomitterStreamServer.TryParseIpv4Address(const Value: string;
+  out AddressValue: Cardinal): Boolean;
+var
+  Parts: TStringList;
+  I: Integer;
+  Octet: Integer;
+begin
+  AddressValue := 0;
+  Result := False;
+  Parts := TStringList.Create;
+  try
+    ExtractStrings(['.'], [], PChar(Trim(Value)), Parts);
+    if Parts.Count <> 4 then
+      Exit(False);
+    for I := 0 to 3 do
+    begin
+      if (Parts[I] = '') or (not TryStrToInt(Parts[I], Octet)) then
+        Exit(False);
+      if (Octet < 0) or (Octet > 255) then
+        Exit(False);
+      AddressValue := (AddressValue shl 8) or Cardinal(Octet);
+    end;
+    Result := True;
+  finally
+    Parts.Free;
+  end;
+end;
+
 class function TRomitterStreamServer.GetClientIpHash(
   const ClientSocket: TSocket): Cardinal;
 var
   Addr: TSockAddrIn;
   AddrSock: TSockAddr absolute Addr;
   AddrLen: Integer;
+  ParsedAddress: Cardinal;
 begin
+  if GStreamProxyProtocolAddressValid and
+     TryParseIpv4Address(GStreamProxyProtocolClientAddress, ParsedAddress) then
+    Exit(ParsedAddress);
+
   Result := 0;
   ZeroMemory(@Addr, SizeOf(Addr));
   AddrLen := SizeOf(Addr);
@@ -1388,7 +1641,13 @@ procedure TRomitterStreamServer.HandleClient(
 var
   ConfigSnapshot: TRomitterConfig;
   ServerSnapshot: TRomitterStreamServerConfig;
+  ProxyClientAddress: string;
+  ProxyErrorText: string;
+  ProxyAddressValue: Cardinal;
+  ProxyHeaderTimeoutMs: Integer;
 begin
+  GStreamProxyProtocolClientAddress := '';
+  GStreamProxyProtocolAddressValid := False;
   try
     ConfigSnapshot := AcquireConfigSnapshot;
     if ConfigSnapshot = nil then
@@ -1404,10 +1663,35 @@ begin
         Exit;
       end;
 
+      if Listener.UsesProxyProtocol then
+      begin
+        ProxyHeaderTimeoutMs := 10000;
+        setsockopt(
+          ClientSocket,
+          SOL_SOCKET,
+          SO_RCVTIMEO,
+          PAnsiChar(@ProxyHeaderTimeoutMs),
+          SizeOf(ProxyHeaderTimeoutMs));
+        if not ReadProxyProtocolHeader(ClientSocket, ProxyClientAddress, ProxyErrorText) then
+        begin
+          FLogger.Log(rlWarn, Format(
+            'stream PROXY protocol header rejected on %s:%d: %s',
+            [Listener.ListenHost, Listener.ListenPort, ProxyErrorText]));
+          Exit;
+        end;
+        if TryParseIpv4Address(ProxyClientAddress, ProxyAddressValue) then
+        begin
+          GStreamProxyProtocolClientAddress := ProxyClientAddress;
+          GStreamProxyProtocolAddressValid := True;
+        end;
+      end;
+
       if not ProxySession(ClientSocket, ServerSnapshot) then
         FLogger.Log(rlWarn, Format('stream proxy session failed for listen %s:%d',
           [ServerSnapshot.ListenHost, ServerSnapshot.ListenPort]));
     finally
+      GStreamProxyProtocolClientAddress := '';
+      GStreamProxyProtocolAddressValid := False;
       GStreamRequestConfig := nil;
       LeaveConfigUsage(ConfigSnapshot);
     end;

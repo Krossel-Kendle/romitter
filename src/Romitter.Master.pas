@@ -734,6 +734,15 @@ procedure TRomitterMaster.StartCurrentRuntime;
 var
   WorkerCount: Integer;
 begin
+  if not FConfig.MasterProcess then
+  begin
+    FWorkerModeEnabled := False;
+    StartSingleRuntime;
+    FLogger.Log(rlInfo,
+      'master_process off: running in single-process mode');
+    Exit;
+  end;
+
   WorkerCount := FConfig.EffectiveWorkerProcesses;
   if WorkerCount < 1 then
     WorkerCount := 1;

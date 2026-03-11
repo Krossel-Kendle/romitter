@@ -9,7 +9,8 @@ uses
   Winapi.Windows,
   Winapi.Winsock2,
   Romitter.Config.Model,
-  Romitter.Logging;
+  Romitter.Logging,
+  Romitter.OpenSsl;
 
 type
   TRomitterProxyAttemptKind = (pakOk, pakError, pakTimeout, pakInvalidHeader);
@@ -21,11 +22,15 @@ type
     ListenHost: string;
     ListenPort: Word;
     IsSsl: Boolean;
+    IsHttp2: Boolean;
+    UsesProxyProtocol: Boolean;
     TlsEndpoint: TObject;
     ListenSocket: TSocket;
     AcceptThread: TThread;
     constructor Create(const AHost: string; const APort: Word;
       const AIsSsl: Boolean = False;
+      const AIsHttp2: Boolean = False;
+      const AUsesProxyProtocol: Boolean = False;
       const ATlsEndpoint: TObject = nil);
     destructor Destroy; override;
   end;
@@ -53,9 +58,25 @@ type
     procedure ClientConnected(const ClientSocket: TSocket);
     procedure ClientDisconnected(const ClientSocket: TSocket);
     procedure ForceCloseClients;
+    function ReadProxyProtocolHeader(const ClientSocket: TSocket;
+      out ClientAddress: string; out ClientPort: Word;
+      out ErrorText: string): Boolean;
     function EstablishClientTls(const ClientSocket: TSocket;
       const TlsEndpoint: TObject; out ClientSsl: Pointer): Boolean;
+    procedure HandleClientHttp2(const ClientSocket: TSocket;
+      const ClientSsl: TRomitterSsl; const LocalPort: Word;
+      const LocalAddress: string);
     procedure HandleClient(const ClientSocket: TSocket; const LocalPort: Word);
+    function HandleHttp2Request(
+      const ClientSocket: TSocket;
+      const StreamId: Cardinal;
+      const Method, Path, Scheme, Authority: string;
+      const Headers: TDictionary<string, string>;
+      const Body: TBytes;
+      const LocalPort: Word;
+      const LocalAddress: string;
+      out ResponseRaw: TBytes;
+      out CloseConnection: Boolean): Boolean;
     function ReceiveRequest(const ClientSocket: TSocket; out Method, Uri, Version: string;
       const Headers: TDictionary<string, string>; out Body: TBytes;
       out ErrorStatusCode: Integer; var PendingRaw: TBytes;
@@ -231,7 +252,7 @@ uses
   System.RegularExpressions,
   Romitter.Constants,
   Romitter.Utils,
-  Romitter.OpenSsl;
+  Romitter.Http2;
 
 const
   MAX_HEADER_SIZE = 65536;
@@ -244,6 +265,13 @@ threadvar
   GHttpRequestConfig: TRomitterConfig;
   GActiveTlsClientSocket: TSocket;
   GActiveTlsClientSession: TRomitterSsl;
+  GProxyProtocolClientAddress: string;
+  GProxyProtocolClientPort: Word;
+  GProxyProtocolAddressValid: Boolean;
+  GHttp2CaptureEnabled: Boolean;
+  GHttp2CaptureSocket: TSocket;
+  GHttp2CapturedResponse: TBytes;
+  GHttp2CaptureCloseConnection: Boolean;
 
 procedure StartThreadCompat(const Thread: TThread);
 begin
@@ -293,6 +321,7 @@ type
   private
     FListenHost: string;
     FListenPort: Word;
+    FEnableHttp2: Boolean;
     FEntries: TObjectList<TRomitterTlsServerEntry>;
     FOwnedContexts: TList<TRomitterSslContext>;
     FDefaultContext: TRomitterSslContext;
@@ -310,7 +339,8 @@ type
     class function BuildContextCacheKey(const Server: TRomitterServerConfig): string; static;
     function ResolveServerContext(const ServerName: string): TRomitterSslContext;
   public
-    constructor Create(const AListenHost: string; const AListenPort: Word);
+    constructor Create(const AListenHost: string; const AListenPort: Word;
+      const AEnableHttp2: Boolean);
     destructor Destroy; override;
     function BuildFromConfig(const Config: TRomitterConfig;
       const Logger: TRomitterLogger; out ErrorText: string): Boolean;
@@ -335,17 +365,24 @@ type
     FClientSocket: TSocket;
     FLocalPort: Word;
     FIsSsl: Boolean;
+    FIsHttp2: Boolean;
+    FUsesProxyProtocol: Boolean;
     FTlsEndpoint: TRomitterTlsEndpoint;
   protected
     procedure Execute; override;
   public
     constructor Create(const Owner: TRomitterHttpServer;
       const ClientSocket: TSocket; const LocalPort: Word;
-      const IsSsl: Boolean; const TlsEndpoint: TRomitterTlsEndpoint);
+      const IsSsl: Boolean; const IsHttp2: Boolean;
+      const UsesProxyProtocol: Boolean;
+      const TlsEndpoint: TRomitterTlsEndpoint);
   end;
 
 function OpenSslServerNameCallback(ssl: TRomitterSsl; ad: PInteger;
   arg: Pointer): Integer; cdecl; forward;
+function OpenSslAlpnSelectCallback(ssl: TRomitterSsl; out OutProto: PByte;
+  out OutProtoLen: Byte; const InProto: PByte; InProtoLen: Cardinal;
+  Arg: Pointer): Integer; cdecl; forward;
 
 constructor TRomitterTlsServerEntry.Create(const AServerNames: TArray<string>;
   const ASslContext: TRomitterSslContext; const AIsDefaultServer: Boolean);
@@ -357,11 +394,12 @@ begin
 end;
 
 constructor TRomitterTlsEndpoint.Create(const AListenHost: string;
-  const AListenPort: Word);
+  const AListenPort: Word; const AEnableHttp2: Boolean);
 begin
   inherited Create;
   FListenHost := AListenHost;
   FListenPort := AListenPort;
+  FEnableHttp2 := AEnableHttp2;
   FEntries := TObjectList<TRomitterTlsServerEntry>.Create(True);
   FOwnedContexts := TList<TRomitterSslContext>.Create;
   FDefaultContext := nil;
@@ -672,6 +710,19 @@ begin
       Exit(False);
     end;
 
+  if FEnableHttp2 then
+    for ContextItem in FOwnedContexts do
+      if not OpenSslSetAlpnSelectCallback(
+        ContextItem,
+        @OpenSslAlpnSelectCallback,
+        Self,
+        ErrorText) then
+      begin
+        ErrorText := Format('TLS ALPN setup failed for %s:%d: %s',
+          [FListenHost, FListenPort, ErrorText]);
+        Exit(False);
+      end;
+
   Result := True;
 end;
 
@@ -779,6 +830,19 @@ end;
 function WriteToSocketCompat(const SocketHandle: TSocket; const Buffer: Pointer;
   const BufferLen: Integer): Integer;
 begin
+  if GHttp2CaptureEnabled and (GHttp2CaptureSocket = SocketHandle) then
+  begin
+    if BufferLen > 0 then
+    begin
+      SetLength(GHttp2CapturedResponse, Length(GHttp2CapturedResponse) + BufferLen);
+      Move(
+        Buffer^,
+        GHttp2CapturedResponse[Length(GHttp2CapturedResponse) - BufferLen],
+        BufferLen);
+    end;
+    Exit(BufferLen);
+  end;
+
   if (GActiveTlsClientSession = nil) or
      (GActiveTlsClientSocket <> SocketHandle) then
     Exit(send(SocketHandle, Buffer^, BufferLen, 0));
@@ -808,6 +872,73 @@ begin
     Result := SSL_TLSEXT_ERR_OK;
   except
     Result := SSL_TLSEXT_ERR_NOACK;
+  end;
+end;
+
+function OpenSslAlpnSelectCallback(ssl: TRomitterSsl; out OutProto: PByte;
+  out OutProtoLen: Byte; const InProto: PByte; InProtoLen: Cardinal;
+  Arg: Pointer): Integer; cdecl;
+const
+  SSL_TLSEXT_ERR_OK = 0;
+  SSL_TLSEXT_ERR_NOACK = 3;
+  ALPN_H2: array[0..1] of Byte = (Ord('h'), Ord('2'));
+  ALPN_HTTP11: array[0..7] of Byte =
+    (Ord('h'), Ord('t'), Ord('t'), Ord('p'), Ord('/'), Ord('1'), Ord('.'), Ord('1'));
+var
+  Endpoint: TRomitterTlsEndpoint;
+  Cursor: PByte;
+  Remaining: Integer;
+  ProtoLen: Integer;
+  HasHttp11: Boolean;
+begin
+  Result := SSL_TLSEXT_ERR_NOACK;
+  OutProto := nil;
+  OutProtoLen := 0;
+  if (Arg = nil) or (InProto = nil) then
+    Exit;
+
+  Endpoint := TRomitterTlsEndpoint(Arg);
+  Cursor := InProto;
+  Remaining := Integer(InProtoLen);
+  HasHttp11 := False;
+
+  while Remaining > 0 do
+  begin
+    ProtoLen := Cursor^;
+    Inc(Cursor);
+    Dec(Remaining);
+    if ProtoLen > Remaining then
+      Exit(SSL_TLSEXT_ERR_NOACK);
+
+    if Endpoint.FEnableHttp2 and (ProtoLen = 2) and
+       (PByte(NativeUInt(Cursor) + 0)^ = ALPN_H2[0]) and
+       (PByte(NativeUInt(Cursor) + 1)^ = ALPN_H2[1]) then
+    begin
+      OutProto := @ALPN_H2[0];
+      OutProtoLen := 2;
+      Exit(SSL_TLSEXT_ERR_OK);
+    end;
+
+    if (ProtoLen = 8) and
+       (PByte(NativeUInt(Cursor) + 0)^ = ALPN_HTTP11[0]) and
+       (PByte(NativeUInt(Cursor) + 1)^ = ALPN_HTTP11[1]) and
+       (PByte(NativeUInt(Cursor) + 2)^ = ALPN_HTTP11[2]) and
+       (PByte(NativeUInt(Cursor) + 3)^ = ALPN_HTTP11[3]) and
+       (PByte(NativeUInt(Cursor) + 4)^ = ALPN_HTTP11[4]) and
+       (PByte(NativeUInt(Cursor) + 5)^ = ALPN_HTTP11[5]) and
+       (PByte(NativeUInt(Cursor) + 6)^ = ALPN_HTTP11[6]) and
+       (PByte(NativeUInt(Cursor) + 7)^ = ALPN_HTTP11[7]) then
+      HasHttp11 := True;
+
+    Inc(Cursor, ProtoLen);
+    Dec(Remaining, ProtoLen);
+  end;
+
+  if HasHttp11 then
+  begin
+    OutProto := @ALPN_HTTP11[0];
+    OutProtoLen := 8;
+    Result := SSL_TLSEXT_ERR_OK;
   end;
 end;
 
@@ -1106,12 +1237,15 @@ begin
 end;
 
 constructor TRomitterHttpListener.Create(const AHost: string; const APort: Word;
-  const AIsSsl: Boolean; const ATlsEndpoint: TObject);
+  const AIsSsl: Boolean; const AIsHttp2: Boolean;
+  const AUsesProxyProtocol: Boolean; const ATlsEndpoint: TObject);
 begin
   inherited Create;
   ListenHost := AHost;
   ListenPort := APort;
   IsSsl := AIsSsl;
+  IsHttp2 := AIsHttp2;
+  UsesProxyProtocol := AUsesProxyProtocol;
   TlsEndpoint := ATlsEndpoint;
   ListenSocket := INVALID_SOCKET;
   AcceptThread := nil;
@@ -1143,7 +1277,9 @@ end;
 
 constructor TRomitterClientThread.Create(const Owner: TRomitterHttpServer;
   const ClientSocket: TSocket; const LocalPort: Word;
-  const IsSsl: Boolean; const TlsEndpoint: TRomitterTlsEndpoint);
+  const IsSsl: Boolean; const IsHttp2: Boolean;
+  const UsesProxyProtocol: Boolean;
+  const TlsEndpoint: TRomitterTlsEndpoint);
 begin
   inherited Create(True);
   FreeOnTerminate := True;
@@ -1151,6 +1287,8 @@ begin
   FClientSocket := ClientSocket;
   FLocalPort := LocalPort;
   FIsSsl := IsSsl;
+  FIsHttp2 := IsHttp2;
+  FUsesProxyProtocol := UsesProxyProtocol;
   FTlsEndpoint := TlsEndpoint;
   StartThreadCompat(Self);
 end;
@@ -1159,12 +1297,53 @@ procedure TRomitterClientThread.Execute;
 var
   ClientSslRaw: Pointer;
   ClientSsl: TRomitterSsl;
+  NegotiatedAlpn: string;
+  UseHttp2: Boolean;
+  ProxyClientAddress: string;
+  ProxyErrorText: string;
+  ProxyClientPort: Word;
+  ProxyHeaderTimeoutMs: Integer;
+  LocalAddress: string;
+  LocalPortResolved: Word;
 begin
   ClientSslRaw := nil;
   ClientSsl := nil;
   GActiveTlsClientSession := nil;
   GActiveTlsClientSocket := INVALID_SOCKET;
+  GProxyProtocolClientAddress := '';
+  GProxyProtocolClientPort := 0;
+  GProxyProtocolAddressValid := False;
+  GHttp2CaptureEnabled := False;
+  GHttp2CaptureSocket := INVALID_SOCKET;
+  GHttp2CapturedResponse := nil;
+  GHttp2CaptureCloseConnection := False;
   try
+    if FUsesProxyProtocol then
+    begin
+      ProxyHeaderTimeoutMs := 10000;
+      setsockopt(
+        FClientSocket,
+        SOL_SOCKET,
+        SO_RCVTIMEO,
+        PAnsiChar(@ProxyHeaderTimeoutMs),
+        SizeOf(ProxyHeaderTimeoutMs));
+      if not FOwner.ReadProxyProtocolHeader(
+        FClientSocket,
+        ProxyClientAddress,
+        ProxyClientPort,
+        ProxyErrorText) then
+      begin
+        FOwner.FLogger.Log(rlWarn, 'PROXY protocol header rejected: ' + ProxyErrorText);
+        Exit;
+      end;
+      if ProxyClientAddress <> '' then
+      begin
+        GProxyProtocolClientAddress := ProxyClientAddress;
+        GProxyProtocolClientPort := ProxyClientPort;
+        GProxyProtocolAddressValid := True;
+      end;
+    end;
+
     if FIsSsl and
        (not FOwner.EstablishClientTls(FClientSocket, FTlsEndpoint, ClientSslRaw)) then
       Exit;
@@ -1174,7 +1353,34 @@ begin
       GActiveTlsClientSocket := FClientSocket;
       GActiveTlsClientSession := ClientSsl;
     end;
-    FOwner.HandleClient(FClientSocket, FLocalPort);
+
+    LocalAddress := '0.0.0.0';
+    LocalPortResolved := FLocalPort;
+    TRomitterHttpServer.TryGetLocalEndpoint(
+      FClientSocket,
+      LocalAddress,
+      LocalPortResolved);
+
+    UseHttp2 := False;
+    if FIsHttp2 then
+    begin
+      if ClientSsl <> nil then
+      begin
+        NegotiatedAlpn := LowerCase(OpenSslGetSelectedAlpnProtocol(ClientSsl));
+        UseHttp2 := SameText(NegotiatedAlpn, 'h2');
+      end
+      else
+        UseHttp2 := False;
+    end;
+
+    if UseHttp2 then
+      FOwner.HandleClientHttp2(
+        FClientSocket,
+        ClientSsl,
+        LocalPortResolved,
+        LocalAddress)
+    else
+      FOwner.HandleClient(FClientSocket, LocalPortResolved);
   finally
     if ClientSsl <> nil then
     begin
@@ -1182,6 +1388,13 @@ begin
       GActiveTlsClientSession := nil;
       GActiveTlsClientSocket := INVALID_SOCKET;
     end;
+    GProxyProtocolClientAddress := '';
+    GProxyProtocolClientPort := 0;
+    GProxyProtocolAddressValid := False;
+    GHttp2CaptureEnabled := False;
+    GHttp2CaptureSocket := INVALID_SOCKET;
+    GHttp2CapturedResponse := nil;
+    GHttp2CaptureCloseConnection := False;
     shutdown(FClientSocket, SD_BOTH);
     closesocket(FClientSocket);
     FOwner.ClientDisconnected(FClientSocket);
@@ -1330,6 +1543,7 @@ var
   SkipListen: Boolean;
   NormalizedHost: string;
   ListenSslModeConflict: Boolean;
+  ListenProxyProtocolConflict: Boolean;
   TlsEndpoint: TRomitterTlsEndpoint;
   TlsErrorText: string;
   SharedListenLogged: TDictionary<string, Boolean>;
@@ -1381,17 +1595,9 @@ begin
       else
         NormalizedHost := ListenCfg.Host;
 
-      if ListenCfg.IsHttp2 then
-        raise Exception.CreateFmt(
-          'listen %s:%d http2 is configured, but HTTP/2 runtime is not implemented yet',
-          [NormalizedHost, ListenCfg.Port]);
-      if ListenCfg.UsesProxyProtocol then
-        raise Exception.CreateFmt(
-          'listen %s:%d proxy_protocol is configured, but PROXY protocol support is not implemented yet',
-          [NormalizedHost, ListenCfg.Port]);
-
       SkipListen := False;
       ListenSslModeConflict := False;
+      ListenProxyProtocolConflict := False;
       for Existing in FListeners do
       begin
         if Existing.ListenPort <> ListenCfg.Port then
@@ -1402,6 +1608,8 @@ begin
         begin
           if Existing.IsSsl <> ListenCfg.IsSsl then
             ListenSslModeConflict := True
+          else if Existing.UsesProxyProtocol <> ListenCfg.UsesProxyProtocol then
+            ListenProxyProtocolConflict := True
           else
             SkipListen := True;
           Break;
@@ -1410,6 +1618,10 @@ begin
       if ListenSslModeConflict then
         raise Exception.CreateFmt(
           'Conflicting listen options for %s:%d: ssl and non-ssl listeners cannot share endpoint',
+          [NormalizedHost, ListenCfg.Port]);
+      if ListenProxyProtocolConflict then
+        raise Exception.CreateFmt(
+          'Conflicting listen options for %s:%d: proxy_protocol and non-proxy_protocol listeners cannot share endpoint',
           [NormalizedHost, ListenCfg.Port]);
       if SkipListen then
       begin
@@ -1420,7 +1632,7 @@ begin
           SharedListenKey := SharedListenKey + ':plain';
         if not SharedListenLogged.ContainsKey(SharedListenKey) then
         begin
-          FLogger.Log(rlInfo, Format(
+          FLogger.Log(rlDebug, Format(
             'HTTP listen %s:%d is shared across server blocks; reusing existing listener',
             [NormalizedHost, ListenCfg.Port]));
           SharedListenLogged.Add(SharedListenKey, True);
@@ -1433,7 +1645,8 @@ begin
       begin
         TlsEndpoint := TRomitterTlsEndpoint.Create(
           NormalizedHost,
-          ListenCfg.Port);
+          ListenCfg.Port,
+          ListenCfg.IsHttp2);
         try
           if not TlsEndpoint.BuildFromConfig(FConfig, FLogger, TlsErrorText) then
             raise Exception.CreateFmt(
@@ -1450,6 +1663,8 @@ begin
         NormalizedHost,
         ListenCfg.Port,
         ListenCfg.IsSsl,
+        ListenCfg.IsHttp2,
+        ListenCfg.UsesProxyProtocol,
         TlsEndpoint);
       try
         TlsEndpoint := nil;
@@ -1491,9 +1706,9 @@ begin
 
     for Listener in FListeners do
       if Listener.IsSsl then
-        FLogger.Log(rlInfo, Format('HTTPS listening on %s:%d', [Listener.ListenHost, Listener.ListenPort]))
+        FLogger.Log(rlDebug, Format('HTTPS listening on %s:%d', [Listener.ListenHost, Listener.ListenPort]))
       else
-        FLogger.Log(rlInfo, Format('HTTP listening on %s:%d', [Listener.ListenHost, Listener.ListenPort]));
+        FLogger.Log(rlDebug, Format('HTTP listening on %s:%d', [Listener.ListenHost, Listener.ListenPort]));
     StartupCompleted := True;
   finally
     if not StartupCompleted then
@@ -1519,6 +1734,249 @@ begin
     shutdown(ClientSocket, SD_BOTH);
     closesocket(ClientSocket);
   end;
+end;
+
+function TRomitterHttpServer.ReadProxyProtocolHeader(
+  const ClientSocket: TSocket; out ClientAddress: string; out ClientPort: Word;
+  out ErrorText: string): Boolean;
+const
+  MAX_PROXY_V1_HEADER = 512;
+  PROXY_V2_SIGNATURE: array[0..11] of Byte =
+    ($0D, $0A, $0D, $0A, $00, $0D, $0A, $51, $55, $49, $54, $0A);
+var
+  FirstByte: Byte;
+  PrefixBytes: TBytes;
+  HeaderBytes: TBytes;
+  Payload: TBytes;
+  LineBytes: TBytes;
+  ByteValue: Byte;
+  ReadLen: Integer;
+  I: Integer;
+  LineText: string;
+  Parts: TStringList;
+  ProxyTransport: string;
+  SrcPortValue: Integer;
+  IpValue: Cardinal;
+  VersionNibble: Byte;
+  CommandNibble: Byte;
+  FamilyNibble: Byte;
+  ProtocolNibble: Byte;
+  PayloadLength: Word;
+  PartValue: Word;
+  function ReadExact(const ByteCount: Integer; out Data: TBytes): Boolean;
+  var
+    Offset: Integer;
+    ChunkLen: Integer;
+  begin
+    SetLength(Data, 0);
+    if ByteCount < 0 then
+      Exit(False);
+    if ByteCount = 0 then
+      Exit(True);
+    SetLength(Data, ByteCount);
+    Offset := 0;
+    while Offset < ByteCount do
+    begin
+      ChunkLen := recv(
+        ClientSocket,
+        Data[Offset],
+        ByteCount - Offset,
+        0);
+      if ChunkLen <= 0 then
+        Exit(False);
+      Inc(Offset, ChunkLen);
+    end;
+    Result := True;
+  end;
+begin
+  Result := False;
+  ErrorText := '';
+  ClientAddress := '';
+  ClientPort := 0;
+
+  ReadLen := recv(ClientSocket, FirstByte, 1, 0);
+  if ReadLen <> 1 then
+  begin
+    ErrorText := 'unable to read PROXY protocol header';
+    Exit(False);
+  end;
+
+  if FirstByte = Ord('P') then
+  begin
+    SetLength(LineBytes, 1);
+    LineBytes[0] := FirstByte;
+    while True do
+    begin
+      if Length(LineBytes) > MAX_PROXY_V1_HEADER then
+      begin
+        ErrorText := 'PROXY protocol v1 header is too large';
+        Exit(False);
+      end;
+      ReadLen := recv(ClientSocket, ByteValue, 1, 0);
+      if ReadLen <> 1 then
+      begin
+        ErrorText := 'unexpected EOF while reading PROXY protocol v1 header';
+        Exit(False);
+      end;
+      SetLength(LineBytes, Length(LineBytes) + 1);
+      LineBytes[High(LineBytes)] := ByteValue;
+      if (Length(LineBytes) >= 2) and
+         (LineBytes[High(LineBytes) - 1] = Ord(#13)) and
+         (LineBytes[High(LineBytes)] = Ord(#10)) then
+        Break;
+    end;
+
+    LineText := TEncoding.ASCII.GetString(LineBytes);
+    LineText := Trim(LineText);
+    if not StartsText('PROXY ', LineText) then
+    begin
+      ErrorText := 'invalid PROXY protocol v1 preface';
+      Exit(False);
+    end;
+
+    Parts := TStringList.Create;
+    try
+      ExtractStrings([' '], [], PChar(LineText), Parts);
+      if Parts.Count < 2 then
+      begin
+        ErrorText := 'invalid PROXY protocol v1 header';
+        Exit(False);
+      end;
+
+      ProxyTransport := UpperCase(Trim(Parts[1]));
+      if ProxyTransport = 'UNKNOWN' then
+      begin
+        Result := True;
+        Exit;
+      end;
+
+      if (ProxyTransport <> 'TCP4') and (ProxyTransport <> 'TCP6') then
+      begin
+        ErrorText := Format('unsupported PROXY protocol v1 transport "%s"', [ProxyTransport]);
+        Exit(False);
+      end;
+
+      if Parts.Count < 6 then
+      begin
+        ErrorText := 'invalid PROXY protocol v1 address tuple';
+        Exit(False);
+      end;
+
+      ClientAddress := Trim(Parts[2]);
+      if (ProxyTransport = 'TCP4') and
+         ((ClientAddress = '') or (not TryParseIpv4Address(ClientAddress, IpValue))) then
+      begin
+        ErrorText := 'invalid PROXY protocol v1 source IPv4 address';
+        Exit(False);
+      end;
+
+      if (not TryStrToInt(Trim(Parts[4]), SrcPortValue)) or
+         (SrcPortValue < 0) or (SrcPortValue > 65535) then
+      begin
+        ErrorText := 'invalid PROXY protocol v1 source port';
+        Exit(False);
+      end;
+      ClientPort := Word(SrcPortValue);
+      Result := True;
+      Exit;
+    finally
+      Parts.Free;
+    end;
+  end;
+
+  if FirstByte <> PROXY_V2_SIGNATURE[0] then
+  begin
+    ErrorText := 'invalid PROXY protocol preface';
+    Exit(False);
+  end;
+
+  if not ReadExact(11, PrefixBytes) then
+  begin
+    ErrorText := 'unable to read PROXY protocol v2 signature';
+    Exit(False);
+  end;
+  for I := 0 to High(PrefixBytes) do
+    if PrefixBytes[I] <> PROXY_V2_SIGNATURE[I + 1] then
+    begin
+      ErrorText := 'invalid PROXY protocol v2 signature';
+      Exit(False);
+    end;
+
+  if not ReadExact(4, HeaderBytes) then
+  begin
+    ErrorText := 'unable to read PROXY protocol v2 header';
+    Exit(False);
+  end;
+
+  VersionNibble := HeaderBytes[0] shr 4;
+  CommandNibble := HeaderBytes[0] and $0F;
+  FamilyNibble := HeaderBytes[1] shr 4;
+  ProtocolNibble := HeaderBytes[1] and $0F;
+  PayloadLength := (Word(HeaderBytes[2]) shl 8) or Word(HeaderBytes[3]);
+
+  if VersionNibble <> $2 then
+  begin
+    ErrorText := 'unsupported PROXY protocol version';
+    Exit(False);
+  end;
+
+  if not ReadExact(PayloadLength, Payload) then
+  begin
+    ErrorText := 'unable to read PROXY protocol v2 payload';
+    Exit(False);
+  end;
+
+  if CommandNibble = $0 then
+  begin
+    // LOCAL command: receiver should ignore address info.
+    Result := True;
+    Exit;
+  end;
+  if CommandNibble <> $1 then
+  begin
+    ErrorText := 'unsupported PROXY protocol v2 command';
+    Exit(False);
+  end;
+
+  if (ProtocolNibble <> $1) and (ProtocolNibble <> $2) then
+  begin
+    ErrorText := 'unsupported PROXY protocol v2 transport';
+    Exit(False);
+  end;
+
+  if (FamilyNibble = $1) and (PayloadLength >= 12) then
+  begin
+    ClientAddress := Format(
+      '%d.%d.%d.%d',
+      [Payload[0], Payload[1], Payload[2], Payload[3]]);
+    ClientPort := (Word(Payload[8]) shl 8) or Word(Payload[9]);
+    Result := True;
+    Exit;
+  end;
+
+  if (FamilyNibble = $2) and (PayloadLength >= 36) then
+  begin
+    ClientAddress := '';
+    for I := 0 to 7 do
+    begin
+      PartValue := (Word(Payload[I * 2]) shl 8) or Word(Payload[I * 2 + 1]);
+      if I > 0 then
+        ClientAddress := ClientAddress + ':';
+      ClientAddress := ClientAddress + LowerCase(IntToHex(PartValue, 1));
+    end;
+    ClientPort := (Word(Payload[32]) shl 8) or Word(Payload[33]);
+    Result := True;
+    Exit;
+  end;
+
+  if FamilyNibble = $0 then
+  begin
+    // UNSPEC family; address is intentionally omitted.
+    Result := True;
+    Exit;
+  end;
+
+  ErrorText := 'unsupported PROXY protocol v2 address family';
 end;
 
 function TRomitterHttpServer.EstablishClientTls(const ClientSocket: TSocket;
@@ -1564,7 +2022,11 @@ begin
   try
     if not OpenSslAcceptSession(Ssl, ErrorText) then
     begin
-      FLogger.Log(rlWarn, 'TLS handshake failed: ' + ErrorText);
+      if ContainsText(ErrorText, 'alert bad certificate') or
+         ContainsText(ErrorText, 'unknown ca') then
+        FLogger.Log(rlDebug, 'TLS handshake failed: ' + ErrorText)
+      else
+        FLogger.Log(rlWarn, 'TLS handshake failed: ' + ErrorText);
       Exit(False);
     end;
     ClientSsl := Ssl;
@@ -1573,6 +2035,103 @@ begin
   finally
     if Ssl <> nil then
       OpenSslFreeSession(Ssl);
+  end;
+end;
+
+procedure TRomitterHttpServer.HandleClientHttp2(const ClientSocket: TSocket;
+  const ClientSsl: TRomitterSsl; const LocalPort: Word;
+  const LocalAddress: string);
+var
+  Connection: TRomitterHttp2Connection;
+begin
+  Connection := TRomitterHttp2Connection.Create(
+    ClientSocket,
+    ClientSsl,
+    FLogger,
+    LocalPort,
+    LocalAddress,
+    HandleHttp2Request);
+  try
+    if not Connection.Run then
+      FLogger.Log(rlDebug, 'HTTP/2 connection closed');
+  finally
+    Connection.Free;
+  end;
+end;
+
+function TRomitterHttpServer.HandleHttp2Request(
+  const ClientSocket: TSocket;
+  const StreamId: Cardinal;
+  const Method, Path, Scheme, Authority: string;
+  const Headers: TDictionary<string, string>;
+  const Body: TBytes;
+  const LocalPort: Word;
+  const LocalAddress: string;
+  out ResponseRaw: TBytes;
+  out CloseConnection: Boolean): Boolean;
+var
+  HeadersCopy: TDictionary<string, string>;
+  Pair: TPair<string, string>;
+  PendingRaw: TBytes;
+  CloseAfterRequest: Boolean;
+  BodyKind: TRomitterRequestBodyKind;
+  BodyContentLength: Integer;
+  RequestUri: string;
+begin
+  ResponseRaw := nil;
+  CloseConnection := False;
+
+  HeadersCopy := TDictionary<string, string>.Create;
+  try
+    for Pair in Headers do
+      HeadersCopy.AddOrSetValue(Pair.Key, Pair.Value);
+
+    if (Authority <> '') and (not HeadersCopy.ContainsKey('host')) then
+      HeadersCopy.Add('host', Authority);
+
+    if Length(Body) > 0 then
+      BodyKind := rbkContentLength
+    else
+      BodyKind := rbkNone;
+    BodyContentLength := Length(Body);
+
+    PendingRaw := nil;
+    CloseAfterRequest := False;
+    RequestUri := Path;
+    if RequestUri = '' then
+      RequestUri := '/';
+    GHttp2CaptureEnabled := True;
+    GHttp2CaptureSocket := ClientSocket;
+    GHttp2CapturedResponse := nil;
+    GHttp2CaptureCloseConnection := False;
+    try
+      ProcessRequest(
+        ClientSocket,
+        Method,
+        RequestUri,
+        'HTTP/2',
+        HeadersCopy,
+        Body,
+        False,
+        BodyKind,
+        BodyContentLength,
+        False,
+        PendingRaw,
+        True,
+        CloseAfterRequest,
+        LocalPort,
+        LocalAddress);
+      ResponseRaw := Copy(GHttp2CapturedResponse, 0, Length(GHttp2CapturedResponse));
+      CloseConnection := CloseAfterRequest or GHttp2CaptureCloseConnection;
+      Result := True;
+    finally
+      GHttp2CaptureEnabled := False;
+      GHttp2CaptureSocket := INVALID_SOCKET;
+      GHttp2CapturedResponse := nil;
+      GHttp2CaptureCloseConnection := False;
+    end;
+  finally
+    HeadersCopy.Free;
   end;
 end;
 
@@ -1706,6 +2265,8 @@ begin
         ClientSocket,
         Listener.ListenPort,
         Listener.IsSsl,
+        Listener.IsHttp2,
+        Listener.UsesProxyProtocol,
         Listener.TlsEndpoint as TRomitterTlsEndpoint);
     except
       on E: Exception do
@@ -3564,6 +4125,9 @@ var
   AddrLen: Integer;
   AddrText: PAnsiChar;
 begin
+  if GProxyProtocolAddressValid and (Trim(GProxyProtocolClientAddress) <> '') then
+    Exit(GProxyProtocolClientAddress);
+
   Result := '';
   ZeroMemory(@Addr, SizeOf(Addr));
   AddrLen := SizeOf(Addr);
@@ -3581,7 +4145,12 @@ var
   Addr: TSockAddrIn;
   AddrSock: TSockAddr absolute Addr;
   AddrLen: Integer;
+  ParsedAddress: Cardinal;
 begin
+  if GProxyProtocolAddressValid and
+     TryParseIpv4Address(GProxyProtocolClientAddress, ParsedAddress) then
+    Exit(ParsedAddress);
+
   Result := 0;
   ZeroMemory(@Addr, SizeOf(Addr));
   AddrLen := SizeOf(Addr);
@@ -5739,7 +6308,7 @@ begin
   if StreamProxyResponse and FiltersRequireBuffering then
   begin
     StreamProxyResponse := False;
-    FLogger.Log(rlInfo, Format(
+    FLogger.Log(rlDebug, Format(
       'proxy_buffering=off overridden due to response filters for "%s"',
       [Location.ProxyPass]));
   end;
@@ -6670,6 +7239,11 @@ var
 begin
   if StatusCode = 444 then
   begin
+    if GHttp2CaptureEnabled and (GHttp2CaptureSocket = ClientSocket) then
+    begin
+      GHttp2CaptureCloseConnection := True;
+      Exit;
+    end;
     shutdown(ClientSocket, SD_BOTH);
     Exit;
   end;
@@ -6697,6 +7271,11 @@ begin
       begin
         if ErrorLocation.ReturnCode = 444 then
         begin
+          if GHttp2CaptureEnabled and (GHttp2CaptureSocket = ClientSocket) then
+          begin
+            GHttp2CaptureCloseConnection := True;
+            Exit;
+          end;
           shutdown(ClientSocket, SD_BOTH);
           Exit;
         end;

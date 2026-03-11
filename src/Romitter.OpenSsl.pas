@@ -25,6 +25,9 @@ function OpenSslCreateClientContext(const Ciphers: string;
 function OpenSslSetServerNameCallback(const SslContext: TRomitterSslContext;
   const Callback: Pointer; const CallbackArg: Pointer;
   out ErrorText: string): Boolean;
+function OpenSslSetAlpnSelectCallback(const SslContext: TRomitterSslContext;
+  const Callback: Pointer; const CallbackArg: Pointer;
+  out ErrorText: string): Boolean;
 function OpenSslCreateSession(const SslContext: TRomitterSslContext;
   const SocketHandle: TSocket; out Ssl: TRomitterSsl;
   out ErrorText: string): Boolean;
@@ -46,6 +49,7 @@ function OpenSslWrite(const Ssl: TRomitterSsl; const Buffer: Pointer;
 function OpenSslSwitchSessionContext(const Ssl: TRomitterSsl;
   const SslContext: TRomitterSslContext): Boolean;
 function OpenSslGetSessionServerName(const Ssl: TRomitterSsl): string;
+function OpenSslGetSelectedAlpnProtocol(const Ssl: TRomitterSsl): string;
 procedure OpenSslFreeSession(var Ssl: TRomitterSsl);
 procedure OpenSslFreeContext(var SslContext: TRomitterSslContext);
 function OpenSslDescribeLastError: string;
@@ -108,6 +112,8 @@ type
     const larg: NativeInt; const parg: Pointer): NativeInt; cdecl;
   TSSL_CTX_callback_ctrl = function(const ctx: Pointer; const cmd: Integer;
     const Callback: Pointer): NativeInt; cdecl;
+  TSSL_CTX_set_alpn_select_cb = procedure(const ctx: Pointer;
+    const Callback: Pointer; const CallbackArg: Pointer); cdecl;
   TSSL_new = function(const ctx: Pointer): Pointer; cdecl;
   TSSL_free = procedure(const ssl: Pointer); cdecl;
   TSSL_set_fd = function(const ssl: Pointer; const fd: Integer): Integer; cdecl;
@@ -125,6 +131,8 @@ type
   TSSL_set_SSL_CTX = function(const ssl: Pointer; const ctx: Pointer): Pointer; cdecl;
   TSSL_get_servername = function(const ssl: Pointer;
     const name_type: Integer): PAnsiChar; cdecl;
+  TSSL_get0_alpn_selected = procedure(const ssl: Pointer;
+    out Data: PAnsiChar; out DataLen: Cardinal); cdecl;
   TSSL_ctrl = function(const ssl: Pointer; const cmd: Integer;
     const larg: NativeInt; const parg: Pointer): NativeInt; cdecl;
   TERR_get_error = function: Cardinal; cdecl;
@@ -157,6 +165,7 @@ var
   FSSL_CTX_set_session_cache_mode: TSSL_CTX_set_session_cache_mode = nil;
   FSSL_CTX_ctrl: TSSL_CTX_ctrl = nil;
   FSSL_CTX_callback_ctrl: TSSL_CTX_callback_ctrl = nil;
+  FSSL_CTX_set_alpn_select_cb: TSSL_CTX_set_alpn_select_cb = nil;
   FSSL_new: TSSL_new = nil;
   FSSL_free: TSSL_free = nil;
   FSSL_set_fd: TSSL_set_fd = nil;
@@ -172,6 +181,7 @@ var
   FSSL_get_error: TSSL_get_error = nil;
   FSSL_set_SSL_CTX: TSSL_set_SSL_CTX = nil;
   FSSL_get_servername: TSSL_get_servername = nil;
+  FSSL_get0_alpn_selected: TSSL_get0_alpn_selected = nil;
   FSSL_ctrl: TSSL_ctrl = nil;
   FERR_get_error: TERR_get_error = nil;
   FERR_error_string_n: TERR_error_string_n = nil;
@@ -228,6 +238,7 @@ begin
   ResolveProc(FSSL_CTX_set_session_cache_mode, GLibSsl, 'SSL_CTX_set_session_cache_mode');
   ResolveProc(FSSL_CTX_ctrl, GLibSsl, 'SSL_CTX_ctrl');
   ResolveProc(FSSL_CTX_callback_ctrl, GLibSsl, 'SSL_CTX_callback_ctrl');
+  ResolveProc(FSSL_CTX_set_alpn_select_cb, GLibSsl, 'SSL_CTX_set_alpn_select_cb');
   ResolveProc(FSSL_new, GLibSsl, 'SSL_new');
   ResolveProc(FSSL_free, GLibSsl, 'SSL_free');
   ResolveProc(FSSL_set_fd, GLibSsl, 'SSL_set_fd');
@@ -243,6 +254,7 @@ begin
   ResolveProc(FSSL_get_error, GLibSsl, 'SSL_get_error');
   ResolveProc(FSSL_set_SSL_CTX, GLibSsl, 'SSL_set_SSL_CTX');
   ResolveProc(FSSL_get_servername, GLibSsl, 'SSL_get_servername');
+  ResolveProc(FSSL_get0_alpn_selected, GLibSsl, 'SSL_get0_alpn_selected');
   ResolveProc(FSSL_ctrl, GLibSsl, 'SSL_ctrl');
   ResolveProc(FERR_get_error, GLibCrypto, 'ERR_get_error');
   ResolveProc(FERR_error_string_n, GLibCrypto, 'ERR_error_string_n');
@@ -728,6 +740,27 @@ begin
   Result := True;
 end;
 
+function OpenSslSetAlpnSelectCallback(const SslContext: TRomitterSslContext;
+  const Callback: Pointer; const CallbackArg: Pointer;
+  out ErrorText: string): Boolean;
+begin
+  Result := False;
+  ErrorText := '';
+  if SslContext = nil then
+  begin
+    ErrorText := 'SSL context is not initialized';
+    Exit(False);
+  end;
+  if not Assigned(FSSL_CTX_set_alpn_select_cb) then
+  begin
+    ErrorText := 'OpenSSL ALPN API is unavailable';
+    Exit(False);
+  end;
+
+  FSSL_CTX_set_alpn_select_cb(SslContext, Callback, CallbackArg);
+  Result := True;
+end;
+
 function OpenSslCreateSession(const SslContext: TRomitterSslContext;
   const SocketHandle: TSocket; out Ssl: TRomitterSsl;
   out ErrorText: string): Boolean;
@@ -1050,6 +1083,26 @@ begin
       nil));
   if ServerNamePtr <> nil then
     Result := string(AnsiString(PAnsiChar(ServerNamePtr)));
+end;
+
+function OpenSslGetSelectedAlpnProtocol(const Ssl: TRomitterSsl): string;
+var
+  ProtocolPtr: PAnsiChar;
+  ProtocolLen: Cardinal;
+  ProtocolAnsi: AnsiString;
+begin
+  Result := '';
+  if (Ssl = nil) or (not Assigned(FSSL_get0_alpn_selected)) then
+    Exit;
+
+  ProtocolPtr := nil;
+  ProtocolLen := 0;
+  FSSL_get0_alpn_selected(Ssl, ProtocolPtr, ProtocolLen);
+  if (ProtocolPtr = nil) or (ProtocolLen = 0) then
+    Exit;
+
+  SetString(ProtocolAnsi, ProtocolPtr, Integer(ProtocolLen));
+  Result := string(ProtocolAnsi);
 end;
 
 procedure OpenSslFreeSession(var Ssl: TRomitterSsl);

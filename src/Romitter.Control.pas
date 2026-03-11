@@ -119,7 +119,14 @@ begin
   end;
 end;
 
-function BuildInstanceKey(const Prefix, ConfigPath: string): string;
+function NormalizePathForInstanceKey(const Value: string): string;
+begin
+  Result := StringReplace(Value, '/', '\', [rfReplaceAll]);
+  while (Length(Result) > 3) and (Result[Length(Result)] = '\') do
+    SetLength(Result, Length(Result) - 1);
+end;
+
+function BuildLegacyInstanceKey(const Prefix, ConfigPath: string): string;
 var
   EffectivePrefix: string;
   EffectiveConfigPath: string;
@@ -138,15 +145,46 @@ begin
   Result := LowerCase(EffectivePrefix) + '|' + LowerCase(EffectiveConfigPath);
 end;
 
+function BuildInstanceKey(const Prefix, ConfigPath: string): string;
+var
+  EffectivePrefix: string;
+  EffectiveConfigPath: string;
+  BasePath: string;
+begin
+  if Prefix <> '' then
+    EffectivePrefix := TPath.GetFullPath(Prefix)
+  else
+    EffectivePrefix := TPath.GetFullPath(ExtractFilePath(ParamStr(0)));
+
+  if EffectivePrefix = '' then
+    EffectivePrefix := TPath.GetFullPath(GetCurrentDir);
+
+  EffectivePrefix := NormalizePathForInstanceKey(EffectivePrefix);
+  BasePath := EffectivePrefix;
+  EffectiveConfigPath := NormalizePathForInstanceKey(ResolvePath(BasePath, ConfigPath));
+  Result := LowerCase(EffectivePrefix) + '|' + LowerCase(EffectiveConfigPath);
+end;
+
+function BuildPipeNameFromInstanceKey(const InstanceKey: string): string;
+begin
+  Result := '\\.\pipe\romitter-' + IntToHex(Fnv1a32(InstanceKey), 8);
+end;
+
 function BuildControlPipeName(const Prefix, ConfigPath: string): string;
 begin
-  Result := '\\.\pipe\romitter-' + IntToHex(Fnv1a32(BuildInstanceKey(Prefix, ConfigPath)), 8);
+  Result := BuildPipeNameFromInstanceKey(BuildInstanceKey(Prefix, ConfigPath));
 end;
 
 function SendSignalToMaster(const Prefix, ConfigPath: string;
   const Signal: TRomitterSignal; out ErrorMessage: string): Boolean;
 var
   PipeName: string;
+  LegacyPipeName: string;
+  ExePrefixLegacyPipeName: string;
+  WaitError: DWORD;
+  LegacyWaitError: DWORD;
+  ExePrefixLegacyWaitError: DWORD;
+  PipeReady: Boolean;
   PipeHandle: THandle;
   Payload: AnsiString;
   BytesWritten: DWORD;
@@ -160,11 +198,66 @@ begin
   end;
 
   PipeName := BuildControlPipeName(Prefix, ConfigPath);
-  if not WaitNamedPipe(PChar(PipeName), DEFAULT_PIPE_WAIT_MS) then
+  LegacyPipeName := '';
+  ExePrefixLegacyPipeName := '';
+  WaitError := 0;
+  LegacyWaitError := 0;
+  ExePrefixLegacyWaitError := 0;
+  PipeReady := WaitNamedPipe(PChar(PipeName), DEFAULT_PIPE_WAIT_MS);
+  if not PipeReady then
   begin
-    ErrorMessage := Format('master control pipe is unavailable: %s (error %d)',
-      [PipeName, GetLastError]);
-    Exit(False);
+    WaitError := GetLastError;
+
+    if WaitError = ERROR_FILE_NOT_FOUND then
+    begin
+      // Compatibility fallback for old key hashing where trailing "\" in -p
+      // changed instance identity.
+      LegacyPipeName := BuildPipeNameFromInstanceKey(
+        BuildLegacyInstanceKey(Prefix, ConfigPath));
+      if (LegacyPipeName <> PipeName) and
+         WaitNamedPipe(PChar(LegacyPipeName), DEFAULT_PIPE_WAIT_MS) then
+      begin
+        PipeName := LegacyPipeName;
+        PipeReady := True;
+      end
+      else if LegacyPipeName <> PipeName then
+        LegacyWaitError := GetLastError;
+
+      if (not PipeReady) and (Prefix <> '') then
+      begin
+        // Compatibility fallback when master was started without -p (prefix
+        // derived from executable path), while signal command uses explicit -p.
+        ExePrefixLegacyPipeName := BuildPipeNameFromInstanceKey(
+          BuildLegacyInstanceKey('', ConfigPath));
+        if (ExePrefixLegacyPipeName <> PipeName) and
+           (ExePrefixLegacyPipeName <> LegacyPipeName) and
+           WaitNamedPipe(PChar(ExePrefixLegacyPipeName), DEFAULT_PIPE_WAIT_MS) then
+        begin
+          PipeName := ExePrefixLegacyPipeName;
+          PipeReady := True;
+        end
+        else if (ExePrefixLegacyPipeName <> PipeName) and
+                (ExePrefixLegacyPipeName <> LegacyPipeName) then
+          ExePrefixLegacyWaitError := GetLastError;
+      end;
+    end;
+
+    if not PipeReady then
+    begin
+      ErrorMessage := Format('master control pipe is unavailable: %s (error %d)',
+        [BuildControlPipeName(Prefix, ConfigPath), WaitError]);
+      if (LegacyPipeName <> '') and (LegacyPipeName <> PipeName) then
+        ErrorMessage := ErrorMessage + Format(
+          '; legacy pipe is unavailable: %s (error %d)',
+          [LegacyPipeName, LegacyWaitError]);
+      if (ExePrefixLegacyPipeName <> '') and
+         (ExePrefixLegacyPipeName <> PipeName) and
+         (ExePrefixLegacyPipeName <> LegacyPipeName) then
+        ErrorMessage := ErrorMessage + Format(
+          '; executable-prefix legacy pipe is unavailable: %s (error %d)',
+          [ExePrefixLegacyPipeName, ExePrefixLegacyWaitError]);
+      Exit(False);
+    end;
   end;
 
   PipeHandle := CreateFile(
@@ -294,12 +387,10 @@ var
   PipeHandle: THandle;
   Connected: BOOL;
   ErrorCode: DWORD;
-  NextPipeBusyLogTick: UInt64;
   Buffer: array[0..127] of AnsiChar;
   BytesRead: DWORD;
   SignalText: string;
 begin
-  NextPipeBusyLogTick := 0;
   while not FStopping do
   begin
     PipeHandle := CreateNamedPipe(
@@ -315,19 +406,15 @@ begin
     if PipeHandle = INVALID_HANDLE_VALUE then
     begin
       ErrorCode := GetLastError;
-      if ErrorCode = ERROR_PIPE_BUSY then
+      if (ErrorCode = ERROR_PIPE_BUSY) or (ErrorCode = 231) then
       begin
-        if Assigned(FLogger) and (GetTickCount64 >= NextPipeBusyLogTick) then
-        begin
-          FLogger.Log(rlWarn, Format(
-            'CreateNamedPipe failed (%d): another master may already own control pipe "%s"',
-            [ErrorCode, FPipeName]));
-          NextPipeBusyLogTick := GetTickCount64 + 5000;
-        end;
+        // Single control pipe instance is still active; retry quietly.
+        Sleep(500);
       end
       else if Assigned(FLogger) then
         FLogger.Log(rlError, Format('CreateNamedPipe failed (%d)', [ErrorCode]));
-      Sleep(200);
+      if ErrorCode <> ERROR_PIPE_BUSY then
+        Sleep(200);
       Continue;
     end;
 

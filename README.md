@@ -6,6 +6,45 @@
 - drop-in operations for common nginx workflows
 - practical Windows-first behavior for proxy workloads
 
+## Versioning and Release Notes
+
+`romitter` uses semantic-style versioning with pre-release tags (`major.minor.patch-label`).
+
+- Current: `0.1.2-alpha`
+- Previous: `0.1.1-alpha`
+
+### Fix Pool: 0.1.2-alpha vs 0.1.1-alpha
+
+- Added server-side HTTP/2 runtime path for TLS listeners with `listen ... ssl http2`.
+- Added ALPN negotiation (`h2` / `http/1.1`) during TLS handshake.
+- Added HTTP/2 frame handling:
+  - `SETTINGS`, `HEADERS`, `CONTINUATION`, `DATA`, `WINDOW_UPDATE`, `PING`, `RST_STREAM`, `GOAWAY`.
+- Added HPACK decoder/encoder runtime components:
+  - indexed/literal header representations
+  - dynamic table updates
+  - Huffman decode support for request header blocks
+- Added HTTP/2 stream state handling for request/response lifecycle.
+- Added HTTP/2-to-existing HTTP runtime bridge so existing location/proxy/file logic is reused for h2 streams.
+- Added `nginx.conf`-style TLS listener ALPN setup via OpenSSL runtime bindings.
+
+### Fix Pool: 0.1.1-alpha vs 0.1.0-alpha
+
+- Added runtime support for `proxy_protocol` on HTTP listeners (`listen ... proxy_protocol`).
+- Added runtime support for `proxy_protocol` on stream TCP listeners.
+- Added parser support for stream `listen ... proxy_protocol`.
+- Added `listen ... http2` runtime compatibility path (directive is accepted at runtime; HTTP/2 frame engine remains iterative work).
+- Added conflict checks for mixed endpoint options:
+  - `proxy_protocol` and non-`proxy_protocol` cannot share one listen endpoint.
+- Added top-level nginx directives:
+  - `master_process on|off`
+  - `daemon on|off`
+- Runtime now honors `master_process off` (single-process mode).
+- Reduced startup/runtime log noise in high-worker deployments:
+  - shared listener reuse messages
+  - repetitive listener startup messages
+  - repeated control pipe busy retries
+  - noisy TLS client-alert handshake logs
+
 ## Why romitter on Windows
 
 Official nginx on Windows is intentionally limited. `romitter` is designed to close that gap and support Windows-specific production use cases, including scenarios that are often unavailable or constrained in standard Windows nginx deployments, for example:

@@ -14,6 +14,7 @@ uses
   Romitter.Config.Parser in 'src\Romitter.Config.Parser.pas',
   Romitter.Control in 'src\Romitter.Control.pas',
   Romitter.Constants in 'src\Romitter.Constants.pas',
+  Romitter.Http2 in 'src\Romitter.Http2.pas',
   Romitter.HttpServer in 'src\Romitter.HttpServer.pas',
   Romitter.Logging in 'src\Romitter.Logging.pas',
   Romitter.Master in 'src\Romitter.Master.pas',

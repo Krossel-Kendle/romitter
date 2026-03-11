@@ -265,6 +265,7 @@ type
     ListenHost: string;
     ListenPort: Word;
     IsUdp: Boolean;
+    UsesProxyProtocol: Boolean;
     ProxyPass: string;
     ProxyConnectTimeoutMs: Integer;
     ProxyReadTimeoutMs: Integer;
@@ -300,6 +301,8 @@ type
   public
     Prefix: string;
     User: string;
+    Daemon: Boolean;
+    MasterProcess: Boolean;
     WorkerProcesses: Integer;
     WorkerRlimitNofile: Integer;
     ErrorLogFile: string;
@@ -788,6 +791,7 @@ begin
   ListenHost := '0.0.0.0';
   ListenPort := 0;
   IsUdp := False;
+  UsesProxyProtocol := False;
   ProxyPass := '';
   ProxyConnectTimeoutMs := 5000;
   ProxyReadTimeoutMs := 600000;
@@ -824,6 +828,8 @@ begin
   inherited Create;
   Prefix := '';
   User := '';
+  Daemon := True;
+  MasterProcess := True;
   WorkerProcesses := 1;
   WorkerRlimitNofile := 0;
   ErrorLogFile := ROMITTER_DEFAULT_ERROR_LOG_FILE;

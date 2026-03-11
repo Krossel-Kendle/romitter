@@ -603,6 +603,40 @@ begin
       Continue;
     end;
 
+    if SameText(Directive.Name, 'daemon') then
+    begin
+      if Length(Directive.Args) <> 1 then
+        raise ERomitterConfig.CreateFmt(
+          '%s(%d): daemon requires one argument',
+          [Directive.SourceFile, Directive.Line]);
+      if SameText(Directive.Args[0], 'on') then
+        Config.Daemon := True
+      else if SameText(Directive.Args[0], 'off') then
+        Config.Daemon := False
+      else
+        raise ERomitterConfig.CreateFmt(
+          '%s(%d): daemon must be on or off',
+          [Directive.SourceFile, Directive.Line]);
+      Continue;
+    end;
+
+    if SameText(Directive.Name, 'master_process') then
+    begin
+      if Length(Directive.Args) <> 1 then
+        raise ERomitterConfig.CreateFmt(
+          '%s(%d): master_process requires one argument',
+          [Directive.SourceFile, Directive.Line]);
+      if SameText(Directive.Args[0], 'on') then
+        Config.MasterProcess := True
+      else if SameText(Directive.Args[0], 'off') then
+        Config.MasterProcess := False
+      else
+        raise ERomitterConfig.CreateFmt(
+          '%s(%d): master_process must be on or off',
+          [Directive.SourceFile, Directive.Line]);
+      Continue;
+    end;
+
     if SameText(Directive.Name, 'error_log') then
     begin
       if Length(Directive.Args) < 1 then
@@ -2603,12 +2637,21 @@ begin
             Server.IsUdp := True;
             Continue;
           end;
+          if SameText(Arg, 'proxy_protocol') then
+          begin
+            Server.UsesProxyProtocol := True;
+            Continue;
+          end;
           raise ERomitterConfig.CreateFmt(
             '%s(%d): unsupported stream listen option "%s"',
             [Child.SourceFile, Child.Line, Arg]);
         end;
         Server.ListenHost := Host;
         Server.ListenPort := Port;
+        if Server.IsUdp and Server.UsesProxyProtocol then
+          raise ERomitterConfig.CreateFmt(
+            '%s(%d): proxy_protocol is supported only for stream tcp listeners',
+            [Child.SourceFile, Child.Line]);
         Continue;
       end;
 
