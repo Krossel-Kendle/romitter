@@ -31,6 +31,8 @@ type
       const ContextName: string); static;
     class procedure ApplyServer(const Directive: TRomitterDirective;
       const Config: TRomitterConfig); static;
+    class procedure ApplyHttpGlobalLocation(const Directive: TRomitterDirective;
+      const Config: TRomitterConfig); static;
     class procedure ApplyStreamServer(const Directive: TRomitterDirective;
       const Config: TRomitterConfig); static;
     class procedure ApplyLocation(const Directive: TRomitterDirective;
@@ -1441,9 +1443,146 @@ begin
       Continue;
     end;
 
+    if SameText(Child.Name, 'location') then
+    begin
+      ApplyHttpGlobalLocation(Child, Config);
+      Continue;
+    end;
+
     raise ERomitterConfig.CreateFmt(
       '%s(%d): unsupported directive "%s" in http',
       [Child.SourceFile, Child.Line, Child.Name]);
+  end;
+end;
+
+class procedure TRomitterConfigLoader.ApplyHttpGlobalLocation(
+  const Directive: TRomitterDirective; const Config: TRomitterConfig);
+var
+  Location: TRomitterLocationConfig;
+  Child: TRomitterDirective;
+  ArgCount: Integer;
+  RegexOptions: TRegExOptions;
+begin
+  ArgCount := Length(Directive.Args);
+  if ArgCount = 0 then
+    raise ERomitterConfig.CreateFmt(
+      '%s(%d): location requires arguments',
+      [Directive.SourceFile, Directive.Line]);
+
+  Location := TRomitterLocationConfig.Create;
+  try
+    if Directive.Args[0] = '=' then
+    begin
+      if ArgCount <> 2 then
+        raise ERomitterConfig.CreateFmt(
+          '%s(%d): location = requires exactly one URI argument',
+          [Directive.SourceFile, Directive.Line]);
+      Location.MatchKind := lmkExact;
+      Location.MatchPath := Directive.Args[1];
+    end
+    else if Directive.Args[0] = '^~' then
+    begin
+      if ArgCount <> 2 then
+        raise ERomitterConfig.CreateFmt(
+          '%s(%d): location ^~ requires exactly one URI argument',
+          [Directive.SourceFile, Directive.Line]);
+      Location.MatchKind := lmkPrefixNoRegex;
+      Location.MatchPath := Directive.Args[1];
+    end
+    else if Directive.Args[0] = '~' then
+    begin
+      if ArgCount <> 2 then
+        raise ERomitterConfig.CreateFmt(
+          '%s(%d): location ~ requires exactly one regex argument',
+          [Directive.SourceFile, Directive.Line]);
+      Location.MatchKind := lmkRegexCaseSensitive;
+      Location.MatchPath := Directive.Args[1];
+    end
+    else if Directive.Args[0] = '~*' then
+    begin
+      if ArgCount <> 2 then
+        raise ERomitterConfig.CreateFmt(
+          '%s(%d): location ~* requires exactly one regex argument',
+          [Directive.SourceFile, Directive.Line]);
+      Location.MatchKind := lmkRegexCaseInsensitive;
+      Location.MatchPath := Directive.Args[1];
+    end
+    else if StartsText('@', Directive.Args[0]) then
+      raise ERomitterConfig.CreateFmt(
+        '%s(%d): named location "%s" is not allowed in http-level location',
+        [Directive.SourceFile, Directive.Line, Directive.Args[0]])
+    else
+    begin
+      if ArgCount <> 1 then
+        raise ERomitterConfig.CreateFmt(
+          '%s(%d): location prefix syntax expects one URI argument',
+          [Directive.SourceFile, Directive.Line]);
+      Location.MatchKind := lmkPrefix;
+      Location.MatchPath := Directive.Args[0];
+    end;
+
+    if (Location.MatchKind = lmkRegexCaseSensitive) or
+       (Location.MatchKind = lmkRegexCaseInsensitive) then
+    begin
+      if Trim(Location.MatchPath) = '' then
+        raise ERomitterConfig.CreateFmt(
+          '%s(%d): location regex pattern must not be empty',
+          [Directive.SourceFile, Directive.Line]);
+
+      if Location.MatchKind = lmkRegexCaseInsensitive then
+        RegexOptions := [roIgnoreCase]
+      else
+        RegexOptions := [];
+      try
+        TRegEx.Create(Location.MatchPath, RegexOptions);
+      except
+        on E: Exception do
+          raise ERomitterConfig.CreateFmt(
+            '%s(%d): invalid location regex "%s": %s',
+            [Directive.SourceFile, Directive.Line, Location.MatchPath, E.Message]);
+      end;
+    end;
+
+    for Child in Directive.Children do
+    begin
+      if SameText(Child.Name, 'allow') then
+      begin
+        if Length(Child.Args) <> 1 then
+          raise ERomitterConfig.CreateFmt(
+            '%s(%d): allow requires one argument',
+            [Child.SourceFile, Child.Line]);
+        Location.AccessRules.Add(TRomitterAccessRuleConfig.Create(
+          True,
+          Trim(Child.Args[0])));
+        Continue;
+      end;
+
+      if SameText(Child.Name, 'deny') then
+      begin
+        if Length(Child.Args) <> 1 then
+          raise ERomitterConfig.CreateFmt(
+            '%s(%d): deny requires one argument',
+            [Child.SourceFile, Child.Line]);
+        Location.AccessRules.Add(TRomitterAccessRuleConfig.Create(
+          False,
+          Trim(Child.Args[0])));
+        Continue;
+      end;
+
+      raise ERomitterConfig.CreateFmt(
+        '%s(%d): unsupported directive "%s" in http-level location (only allow/deny are supported)',
+        [Child.SourceFile, Child.Line, Child.Name]);
+    end;
+
+    if Location.AccessRules.Count = 0 then
+      raise ERomitterConfig.CreateFmt(
+        '%s(%d): http-level location must define at least one allow/deny rule',
+        [Directive.SourceFile, Directive.Line]);
+
+    Config.Http.GlobalLocations.Add(Location);
+    Location := nil;
+  finally
+    Location.Free;
   end;
 end;
 

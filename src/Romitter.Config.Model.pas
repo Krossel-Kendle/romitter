@@ -217,6 +217,7 @@ type
   public
     Enabled: Boolean;
     Servers: TObjectList<TRomitterServerConfig>;
+    GlobalLocations: TObjectList<TRomitterLocationConfig>;
     Upstreams: TObjectList<TRomitterUpstreamConfig>;
     KeepAliveTimeoutMs: Integer;
     ClientHeaderTimeoutMs: Integer;
@@ -735,6 +736,7 @@ begin
   inherited Create;
   Enabled := False;
   Servers := TObjectList<TRomitterServerConfig>.Create(True);
+  GlobalLocations := TObjectList<TRomitterLocationConfig>.Create(True);
   Upstreams := TObjectList<TRomitterUpstreamConfig>.Create(True);
   KeepAliveTimeoutMs := 60000;
   ClientHeaderTimeoutMs := 60000;
@@ -780,6 +782,7 @@ destructor TRomitterHttpConfig.Destroy;
 begin
   AddHeaders.Free;
   ProxySetHeaders.Free;
+  GlobalLocations.Free;
   Upstreams.Free;
   Servers.Free;
   inherited;

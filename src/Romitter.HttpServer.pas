@@ -93,6 +93,10 @@ type
     function SelectServer(const HostHeader: string;
       const LocalPort: Word; const LocalAddress: string): TRomitterServerConfig;
     function SelectLocation(const Server: TRomitterServerConfig; const UriPath: string): TRomitterLocationConfig;
+    function SelectGlobalLocation(const UriPath: string): TRomitterLocationConfig;
+    function SelectLocationFromList(
+      const Locations: TObjectList<TRomitterLocationConfig>;
+      const UriPath: string): TRomitterLocationConfig;
     function FindNamedLocation(const Server: TRomitterServerConfig;
       const Name: string): TRomitterLocationConfig;
     function EvaluateTryFiles(const Server: TRomitterServerConfig;
@@ -3121,6 +3125,7 @@ const
 var
   Server: TRomitterServerConfig;
   Location: TRomitterLocationConfig;
+  GlobalLocation: TRomitterLocationConfig;
   HostHeader: string;
   HostHeaderRaw: string;
   ClientAddress: string;
@@ -3562,6 +3567,7 @@ begin
   CloseConnection := not AllowKeepAlive;
   Server := nil;
   Location := nil;
+  GlobalLocation := nil;
   RequestBody := Body;
   EffectiveBodyDeferred := BodyDeferred;
   EffectiveNeedClientContinue := NeedClientContinue;
@@ -3628,7 +3634,23 @@ begin
       Location := SelectLocation(Server, CurrentUriPath);
     RequestIsHttps := (GActiveTlsClientSession <> nil) or
       IsHttpsOnEndpoint(Server, LocalPort);
+    GlobalLocation := SelectGlobalLocation(CurrentUriPath);
     RefreshClientBodyLimit;
+    if not IsLocationAccessAllowed(ClientAddress, GlobalLocation) then
+    begin
+      PrepareLocalResponse;
+      SendStatus(
+        ClientSocket,
+        403,
+        'Forbidden',
+        CloseConnection,
+        Server,
+        Location,
+        Headers,
+        CurrentUri,
+        nil);
+      Exit;
+    end;
     if not IsLocationAccessAllowed(ClientAddress, Location) then
     begin
       PrepareLocalResponse;
@@ -6899,7 +6921,8 @@ begin
   Result := Candidate;
 end;
 
-function TRomitterHttpServer.SelectLocation(const Server: TRomitterServerConfig;
+function TRomitterHttpServer.SelectLocationFromList(
+  const Locations: TObjectList<TRomitterLocationConfig>;
   const UriPath: string): TRomitterLocationConfig;
 var
   Location: TRomitterLocationConfig;
@@ -6908,9 +6931,11 @@ var
   RegexOptions: TRegExOptions;
 begin
   Result := nil;
+  if Locations = nil then
+    Exit(nil);
 
   // 1) exact location match
-  for Location in Server.Locations do
+  for Location in Locations do
   begin
     if (Location.MatchKind = lmkExact) and (Location.MatchPath = UriPath) then
       Exit(Location);
@@ -6919,7 +6944,7 @@ begin
   // 2) longest prefix match (including ^~ prefixes)
   BestPrefix := nil;
   BestLen := -1;
-  for Location in Server.Locations do
+  for Location in Locations do
   begin
     if (Location.MatchKind <> lmkPrefix) and
        (Location.MatchKind <> lmkPrefixNoRegex) then
@@ -6939,7 +6964,7 @@ begin
     Exit(BestPrefix);
 
   // 3) regex locations in declaration order
-  for Location in Server.Locations do
+  for Location in Locations do
   begin
     if (Location.MatchKind <> lmkRegexCaseSensitive) and
        (Location.MatchKind <> lmkRegexCaseInsensitive) then
@@ -6962,6 +6987,28 @@ begin
 
   // 4) fallback to longest plain prefix
   Result := BestPrefix;
+end;
+
+function TRomitterHttpServer.SelectLocation(const Server: TRomitterServerConfig;
+  const UriPath: string): TRomitterLocationConfig;
+begin
+  if Server = nil then
+    Exit(nil);
+  Result := SelectLocationFromList(Server.Locations, UriPath);
+end;
+
+function TRomitterHttpServer.SelectGlobalLocation(
+  const UriPath: string): TRomitterLocationConfig;
+var
+  Config: TRomitterConfig;
+begin
+  Config := ActiveConfig;
+  if (Config = nil) or (Config.Http = nil) or
+     (Config.Http.GlobalLocations = nil) or
+     (Config.Http.GlobalLocations.Count = 0) then
+    Exit(nil);
+
+  Result := SelectLocationFromList(Config.Http.GlobalLocations, UriPath);
 end;
 
 function TRomitterHttpServer.FindNamedLocation(
